@@ -334,11 +334,25 @@ class BackpackClient(BaseExchangeClient):
 
             if direction == 'buy':
                 # For buy orders, place slightly below best ask to ensure execution
-                order_price = best_ask - self.config.tick_size
+                # 根据重试次数调整价格策略
+                if retry_count <= 5:
+                    order_price = best_ask - self.config.tick_size
+                elif retry_count <= 10:
+                    order_price = best_ask - (self.config.tick_size * 2)
+                else:
+                    # 更保守的价格
+                    order_price = best_bid + self.config.tick_size
                 side = 'Bid'
             else:
                 # For sell orders, place slightly above best bid to ensure execution
-                order_price = best_bid + self.config.tick_size
+                # 根据重试次数调整价格策略
+                if retry_count <= 5:
+                    order_price = best_bid + self.config.tick_size
+                elif retry_count <= 10:
+                    order_price = best_bid + (self.config.tick_size * 2)
+                else:
+                    # 更保守的价格
+                    order_price = best_ask - self.config.tick_size
                 side = 'Ask'
 
             # Place the order using Backpack SDK (post-only to ensure maker order)
@@ -357,7 +371,18 @@ class BackpackClient(BaseExchangeClient):
 
             if 'code' in order_result:
                 message = order_result.get('message', 'Unknown error')
-                self.logger.log(f"[OPEN] Order rejected: {message}", "WARNING")
+                self.logger.log(f"[OPEN] Order rejected (attempt {retry_count}/{max_retries}): {message}", "WARNING")
+                self.logger.log(f"[OPEN] Order details - Side: {side}, Price: {order_price}, Quantity: {quantity}", "DEBUG")
+                
+                # 如果是价格相关错误，尝试调整价格
+                if 'price' in message.lower() or 'post_only' in message.lower():
+                    self.logger.log(f"[OPEN] Price-related rejection, adjusting price strategy", "INFO")
+                    # 可以在这里添加价格调整逻辑
+                
+                # 在重试之间增加延迟，避免过于频繁的请求
+                if retry_count < max_retries:
+                    await asyncio.sleep(0.5 * retry_count)  # 递增延迟
+                
                 continue
 
             # Extract order ID from response

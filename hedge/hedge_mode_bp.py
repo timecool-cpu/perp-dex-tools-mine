@@ -550,6 +550,41 @@ class HedgeBot:
         self.logger.info("✅ Backpack client initialized successfully")
         return self.backpack_client
 
+    async def diagnose_trading_issues(self):
+        """诊断交易问题，提供有用的调试信息"""
+        self.logger.info("🔍 开始诊断交易问题...")
+        
+        try:
+            # 检查账户余额
+            if hasattr(self.backpack_client, 'get_account_balance'):
+                balance = await self.backpack_client.get_account_balance()
+                self.logger.info(f"账户余额: {balance}")
+            
+            # 检查当前市场价格
+            best_bid, best_ask = await self.fetch_backpack_bbo_prices()
+            self.logger.info(f"当前市场价格 - Bid: {best_bid}, Ask: {best_ask}")
+            
+            # 检查价差
+            if best_bid > 0 and best_ask > 0:
+                spread = best_ask - best_bid
+                spread_pct = (spread / best_bid) * 100
+                self.logger.info(f"价差: {spread} ({spread_pct:.2f}%)")
+                
+                if spread_pct > 1.0:
+                    self.logger.warning("⚠️ 价差过大，可能导致下单困难")
+            
+            # 检查订单数量是否合理
+            self.logger.info(f"订单数量: {self.order_quantity}")
+            
+            # 检查合约信息
+            self.logger.info(f"合约ID: {self.backpack_contract_id}")
+            self.logger.info(f"Tick Size: {self.backpack_tick_size}")
+            
+        except Exception as e:
+            self.logger.error(f"诊断过程中出错: {e}")
+        
+        self.logger.info("🔍 诊断完成")
+
     def get_lighter_market_config(self) -> Tuple[int, int, int]:
         """Get Lighter market configuration."""
         url = f"{self.lighter_base_url}/api/v1/orderBooks"
@@ -617,6 +652,7 @@ class HedgeBot:
     async def place_bbo_order(self, side: str, quantity: Decimal):
         # Get best bid/ask prices
         best_bid, best_ask = await self.fetch_backpack_bbo_prices()
+        self.logger.info(f"Current BBO - Bid: {best_bid}, Ask: {best_ask}")
 
         # Place the order using Backpack client
         order_result = await self.backpack_client.place_open_order(
@@ -626,8 +662,17 @@ class HedgeBot:
         )
 
         if order_result.success:
+            self.logger.info(f"Order placed successfully: {order_result.order_id}")
             return order_result.order_id
         else:
+            self.logger.error(f"Failed to place order: {order_result.error_message}")
+            # 提供更详细的错误信息
+            if "Max retries exceeded" in order_result.error_message:
+                self.logger.error("Order placement failed after maximum retries. Possible causes:")
+                self.logger.error("1. Market volatility too high")
+                self.logger.error("2. Insufficient balance")
+                self.logger.error("3. Price too aggressive for post-only orders")
+                self.logger.error("4. Network connectivity issues")
             raise Exception(f"Failed to place order: {order_result.error_message}")
 
     async def place_backpack_post_only_order(self, side: str, quantity: Decimal):
@@ -1080,7 +1125,14 @@ class HedgeBot:
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
-                break
+                
+                # 提供诊断信息
+                await self.diagnose_trading_issues()
+                
+                # 等待一段时间后重试，而不是立即退出
+                self.logger.info("等待30秒后重试...")
+                await asyncio.sleep(30)
+                continue
 
             start_time = time.time()
             while not self.order_execution_complete and not self.stop_flag:
