@@ -143,7 +143,6 @@ class ExtendedClient(BaseExchangeClient):
             active_orders = await self.get_active_orders(self.config.contract_id)
             for order in active_orders:
                 if order.side == "buy":
-                    self.logger.log(f"Canceling order with internal ID: {order.order_id}", "INFO")
                     await self.cancel_order(order.order_id)
                 
             
@@ -212,7 +211,7 @@ class ExtendedClient(BaseExchangeClient):
                     await asyncio.sleep(1)
                     self.logger.log(f"Orderbook is not updated yet, sleeping for 1 second", level="INFO")
                     continue
-                
+
                 best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
 
                 if best_bid <= 0 or best_ask <= 0:
@@ -304,7 +303,8 @@ class ExtendedClient(BaseExchangeClient):
         while retry_count < max_retries:
             try:
                 best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
-
+                print(f"best_bid: {best_bid}, best_ask: {best_ask}")
+                print('--------------------------------')
                 if best_bid <= 0 or best_ask <= 0:
                     return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
@@ -389,9 +389,9 @@ class ExtendedClient(BaseExchangeClient):
                             status=order_info.status
                         )
                     elif order_info.status == 'REJECTED':
-                        return OrderResult(success=False, error_message=f'Close order rejected: {order_info.status}')
+                        raise Exception(f'Close order rejected: {order_info.status}')
                     else:
-                        return OrderResult(success=False, error_message=f'Unexpected close order status: {order_info.status}')
+                        raise Exception(f'Unexpected close order status: {order_info.status}')
                 else:
                     # Assume order is successful if we can't get info
                     self.logger.log(f"Could not get order info for {order_id}, assuming order is successful", level="ERROR")
@@ -416,15 +416,12 @@ class ExtendedClient(BaseExchangeClient):
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Extended using the internal order ID."""
         try:
-            self.logger.log(f"Canceling order with internal ID: {order_id}", level="INFO")
-            
             # save this
             prev_partially_filled_size = self.partially_filled_size
             prev_partially_filled_avg_price = self.partially_filled_avg_price
 
             # cancel the order
             cancel_result = await self.perpetual_trading_client.orders.cancel_order(order_id)
-            self.logger.log(f"cancel_result: {cancel_result}", level="INFO")
 
             if not cancel_result or not cancel_result.data:
                 self.logger.log(f"Failed to cancel order {order_id}: {cancel_result}", level="ERROR")
@@ -456,10 +453,8 @@ class ExtendedClient(BaseExchangeClient):
                     # filled_size is 0
                     pass
             else:
-                self.logger.log(f"Could not get order info for {order_id} when cancelling order, returning filled_size as 0", level="ERROR")
-            
+                self.logger.log(f"Could not get order info for {order_id} when cancelling order, returning filled_size as 0", level="ERROR")            
 
-            self.logger.log(f"Successfully canceled order {order_id}", level="INFO")
             return OrderResult(success=True, filled_size=filled_size)
 
         except Exception as e:
@@ -664,12 +659,6 @@ class ExtendedClient(BaseExchangeClient):
                             self.open_orders[order_id] = order
                         elif status == "CANCELED" or status == "FILLED":
                             self.open_orders.pop(order_id, None)
-                                                                 
-                        # self.logger.log(f"Open orders: {self.open_orders}", "INFO")
-
-                        # ignore canceled close orders
-                        if status == "CANCELED" and order_type == "CLOSE":
-                            return
                         
                         if status in ['OPEN', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED']:
                             if self._order_update_handler:
