@@ -57,9 +57,14 @@ class HedgeStrategy:
 
         # 对冲周期配置与状态
         self.hedge_cycle_seconds = int(self.config.get("hedge_cycle_seconds", 3600))
+        self.hold_time_seconds = int(self.config.get("hold_time_seconds", 3900))  # 默认65分钟
         self.cycle_start_time: Optional[float] = None
         self.cycle_count = 0
         self.cycle_history = []
+        
+        # 维持阶段状态
+        self.hedge_completed_time: Optional[float] = None
+        self.is_holding_position = False
         
         # 自动取消并替换配置
         self.auto_cancel_enabled = config.get('auto_cancel_enabled', True)
@@ -825,6 +830,8 @@ class HedgeStrategy:
                 self.lighter_order_filled = False
                 self.order_placement_time = None
                 self.cycle_start_time = None
+                self.hedge_completed_time = None
+                self.is_holding_position = False
                 
                 # 周期开始兜底：取消两侧挂单并市价效果平仓
                 try:
@@ -857,6 +864,33 @@ class HedgeStrategy:
                     self.logger.log("Paradex 对冲订单下单失败；进入下一个周期。", "ERROR")
                     await asyncio.sleep(1)
                     continue
+
+                # 记录对冲完成时间，开始维持阶段
+                self.hedge_completed_time = time.time()
+                self.is_holding_position = True
+                self.logger.log(f"对冲完成，开始维持阶段，维持时间: {self.hold_time_seconds} 秒", "INFO")
+
+                # 维持阶段：等待指定的维持时间
+                hold_deadline = self.hedge_completed_time + self.hold_time_seconds
+                while self.is_running and time.time() < hold_deadline:
+                    # 在维持阶段进行风险监控
+                    if self.risk_enabled:
+                        try:
+                            if await self.monitor_liquidation_risk():
+                                self.logger.log("维持阶段触发风险退出；停止策略。", "ERROR")
+                                return False
+                        except Exception as e:
+                            self.logger.log(f"维持阶段风险监控出错: {e}", "ERROR")
+                    
+                    # 每10秒记录一次维持状态
+                    remaining_time = hold_deadline - time.time()
+                    if int(remaining_time) % 10 == 0:
+                        self.logger.log(f"维持阶段进行中，剩余时间: {int(remaining_time)} 秒", "DEBUG")
+                    
+                    await asyncio.sleep(1)
+                
+                self.logger.log("维持阶段结束，开始平仓", "INFO")
+                self.is_holding_position = False
 
                 # 等待至周期结束
                 if self.hedge_cycle_seconds > 0 and self.cycle_start_time:
@@ -904,8 +938,10 @@ class HedgeStrategy:
                 cycle_record = {
                     "cycle_index": self.cycle_count,
                     "start_time": self.cycle_start_time,
+                    "hedge_completed_time": self.hedge_completed_time,
                     "end_time": end_ts,
                     "duration_seconds": (end_ts - self.cycle_start_time) if self.cycle_start_time else None,
+                    "hold_duration_seconds": (end_ts - self.hedge_completed_time) if self.hedge_completed_time else None,
                     "lighter_order_id": self.lighter_order_id,
                     "paradex_order_id": self.paradex_order_id,
                     "actions": actions,

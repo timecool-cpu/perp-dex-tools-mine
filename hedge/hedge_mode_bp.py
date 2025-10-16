@@ -32,12 +32,13 @@ class Config:
 class HedgeBot:
     """Trading bot that places post-only orders on Backpack and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20):
+    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, hold_time: int = 3900):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.lighter_order_filled = False
         self.iterations = iterations
+        self.hold_time = hold_time  # 维持时间（秒），默认65分钟=3900秒
         self.backpack_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.current_order = {}
@@ -135,6 +136,10 @@ class HedgeBot:
         self.current_lighter_quantity = None
         self.current_lighter_price = None
         self.lighter_order_info = None
+
+        # Hold phase tracking
+        self.hedge_completed_time = None
+        self.is_holding_position = False
 
         # Lighter API configuration
         self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
@@ -1095,6 +1100,24 @@ class HedgeBot:
 
             if self.stop_flag:
                 break
+
+            # 记录对冲完成时间，开始维持阶段
+            self.hedge_completed_time = time.time()
+            self.is_holding_position = True
+            self.logger.info(f"对冲完成，开始维持阶段，维持时间: {self.hold_time} 秒")
+
+            # 维持阶段：等待指定的维持时间
+            hold_deadline = self.hedge_completed_time + self.hold_time
+            while self.is_running and time.time() < hold_deadline:
+                # 每10秒记录一次维持状态
+                remaining_time = hold_deadline - time.time()
+                if int(remaining_time) % 10 == 0:
+                    self.logger.info(f"维持阶段进行中，剩余时间: {int(remaining_time)} 秒")
+                
+                await asyncio.sleep(1)
+            
+            self.logger.info("维持阶段结束，开始平仓")
+            self.is_holding_position = False
 
             # Close position
             self.logger.info(f"[STEP 2] Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")

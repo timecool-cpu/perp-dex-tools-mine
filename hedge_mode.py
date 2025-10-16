@@ -46,6 +46,8 @@ Examples:
                         help='Number of iterations to run')
     parser.add_argument('--fill-timeout', type=int, default=5,
                         help='Timeout in seconds for maker order fills (default: 5)')
+    parser.add_argument('--hold-time', type=int, default=3900,
+                        help='Hold time in seconds after hedge completion (default: 3900 = 65 minutes)')
     parser.add_argument('--env-file', type=str, default=".env",
                         help=".env file path (default: .env)")
     
@@ -108,14 +110,16 @@ async def main():
                 ticker=args.ticker.upper(),
                 order_quantity=Decimal(args.size),
                 fill_timeout=args.fill_timeout,
-                iterations=args.iter
+                iterations=args.iter,
+                hold_time=args.hold_time
             )
         else:  # extended
             bot = HedgeBotClass(
                 ticker=args.ticker.upper(),
                 order_quantity=Decimal(args.size),
                 fill_timeout=args.fill_timeout,
-                iterations=args.iter
+                iterations=args.iter,
+                hold_time=args.hold_time
             )
         
         # Run the bot

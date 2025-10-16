@@ -25,6 +25,7 @@ async def main():
     parser.add_argument('--price-check-interval', type=int, default=5, help='价格检查间隔（秒）')
     parser.add_argument('--price-tolerance', type=float, default=0.001, help='价格容忍度（0.001 = 0.1%）')
     parser.add_argument('--hedge-cycle-seconds', type=int, default=3600, help='对冲周期（秒），周期开始时挂单，到期取消两边订单')
+    parser.add_argument('--hold-time', type=int, default=3900, help='持仓维持时间（秒），默认65分钟=3900秒')
     args = parser.parse_args()
 
     # 加载环境变量
@@ -50,6 +51,7 @@ async def main():
         "price_check_interval": args.price_check_interval,
         "price_tolerance": args.price_tolerance,
         "hedge_cycle_seconds": args.hedge_cycle_seconds,
+        "hold_time_seconds": args.hold_time,
     }
 
     # 各交易所专用配置（以具名属性对象形式，便于客户端读取）
