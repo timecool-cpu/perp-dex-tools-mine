@@ -94,3 +94,6 @@ echo $BACKPACK_SECRET_KEY
 - **v1.1**: 增加了自动诊断功能
 - **v1.1**: 改进了错误处理和重试机制
 - **v1.1**: 添加了维持时间参数支持
+- **v1.2**: 修复了 `'HedgeBot' object has no attribute 'is_running'` 错误
+- **v1.2**: 改进了异步关闭机制，解决 "Unclosed client session" 警告
+- **v1.2**: 增强了错误处理和资源清理

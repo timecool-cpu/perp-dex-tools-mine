@@ -183,6 +183,36 @@ class HedgeBot:
             except Exception:
                 pass
 
+    async def async_shutdown(self):
+        """Async shutdown handler for proper cleanup."""
+        self.stop_flag = True
+        self.logger.info("\n🛑 Async stopping...")
+
+        # Close WebSocket connections properly
+        if self.extended_client:
+            try:
+                await self.extended_client.disconnect()
+                self.logger.info("🔌 Extended WebSocket disconnected")
+            except Exception as e:
+                self.logger.error(f"Error disconnecting Extended WebSocket: {e}")
+
+        # Cancel Lighter WebSocket task
+        if self.lighter_ws_task and not self.lighter_ws_task.done():
+            try:
+                self.lighter_ws_task.cancel()
+                await self.lighter_ws_task
+                self.logger.info("🔌 Lighter WebSocket task cancelled")
+            except Exception as e:
+                self.logger.error(f"Error cancelling Lighter WebSocket task: {e}")
+
+        # Close logging handlers properly
+        for handler in self.logger.handlers[:]:
+            try:
+                handler.close()
+                self.logger.removeHandler(handler)
+            except Exception:
+                pass
+
     def _initialize_csv_file(self):
         """Initialize CSV file with headers if it doesn't exist."""
         if not os.path.exists(self.csv_filename):
@@ -1153,7 +1183,7 @@ class HedgeBot:
 
             # 维持阶段：等待指定的维持时间
             hold_deadline = self.hedge_completed_time + self.hold_time
-            while self.is_running and time.time() < hold_deadline:
+            while not self.stop_flag and time.time() < hold_deadline:
                 # 每10秒记录一次维持状态
                 remaining_time = hold_deadline - time.time()
                 if int(remaining_time) % 10 == 0:
@@ -1235,9 +1265,11 @@ class HedgeBot:
             await self.trading_loop()
         except KeyboardInterrupt:
             self.logger.info("\n🛑 Received interrupt signal...")
+        except Exception as e:
+            self.logger.error(f"Error in trading loop: {e}")
         finally:
             self.logger.info("🔄 Cleaning up...")
-            self.shutdown()
+            await self.async_shutdown()
 
 
 def parse_arguments():
