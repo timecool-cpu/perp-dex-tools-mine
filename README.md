@@ -355,6 +355,7 @@ python hedge_mode.py --exchange backpack --ticker ETH --size 0.1 --iter 20
 - `--size`: 每笔订单数量
 - `--iter`: 交易循环次数
 - `--fill-timeout`: maker 订单填充超时时间（秒，默认 5）
+- `--hold-time`: 对冲完成后持仓的维持时间（秒，默认 3900，约 65 分钟）
 
 ## 配置
 
