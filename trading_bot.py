@@ -717,39 +717,68 @@ class TradingBot:
                     filled_order = await self._wait_for_order_fill(order_result.order_id, timeout=60, is_open_order=True)
                     
                     if not filled_order:
-                        self.logger.log("Order was not filled within 60 seconds, trying market order...", "WARNING")
+                        self.logger.log("Order was not filled within 60 seconds, checking if position already exists...", "WARNING")
                         
-                        # Cancel the unfilled order first
-                        try:
-                            await self.exchange_client.cancel_order(order_result.order_id)
-                            self.logger.log(f"Cancelled unfilled open order: {order_result.order_id}", "INFO")
-                        except Exception as cancel_error:
-                            self.logger.log(f"Failed to cancel order: {cancel_error}", "WARNING")
-                        
-                        # Try market order for opening position
-                        has_market_order = hasattr(self.exchange_client, 'place_market_order')
-                        if has_market_order:
-                            self.logger.log("Using market order to open position...", "INFO")
-                            market_result = await self.exchange_client.place_market_order(
-                                self.config.contract_id,
-                                self.config.quantity,
-                                self.config.direction
-                            )
+                        # CRITICAL: Check if position already exists before trying market order
+                        current_position = await self.exchange_client.get_account_positions()
+                        if current_position != 0:
+                            self.logger.log(f"CRITICAL: Position already exists: {current_position}, order may have filled but not detected", "ERROR")
+                            self.logger.log("Skipping market order to prevent double position", "WARNING")
                             
-                            if market_result.success:
-                                filled_order = await self._wait_for_order_fill(market_result.order_id, timeout=30, is_open_order=True)
-                                if not filled_order:
-                                    self.logger.log("Market order also failed, retrying in 30 seconds", "ERROR")
-                                    await asyncio.sleep(30)
-                                    continue
+                            # Try to get order info one more time
+                            try:
+                                order_info = await self.exchange_client.get_order_info(order_result.order_id)
+                                if order_info and order_info.status == 'FILLED':
+                                    self.logger.log(f"Order {order_result.order_id} was actually filled: {order_info.filled_size} @ {order_info.price}", "INFO")
+                                    filled_order = order_info
+                                else:
+                                    self.logger.log(f"Order status: {order_info.status if order_info else 'Unknown'}", "WARNING")
+                            except Exception as e:
+                                self.logger.log(f"Error checking order info: {e}", "WARNING")
+                            
+                            if filled_order:
+                                # Position exists and order was filled, continue with the loop
+                                pass
                             else:
-                                self.logger.log(f"Market order failed: {market_result.error_message}, retrying in 30 seconds", "ERROR")
+                                # Position exists but order status unclear, retry
+                                self.logger.log("Position exists but order status unclear, retrying in 30 seconds", "ERROR")
                                 await asyncio.sleep(30)
                                 continue
                         else:
-                            self.logger.log("Exchange does not support market orders, retrying in 30 seconds", "ERROR")
-                            await asyncio.sleep(30)
-                            continue
+                            # No position exists, safe to try market order
+                            self.logger.log("No position exists, trying market order...", "WARNING")
+                            
+                            # Cancel the unfilled order first
+                            try:
+                                await self.exchange_client.cancel_order(order_result.order_id)
+                                self.logger.log(f"Cancelled unfilled open order: {order_result.order_id}", "INFO")
+                            except Exception as cancel_error:
+                                self.logger.log(f"Failed to cancel order: {cancel_error}", "WARNING")
+                            
+                            # Try market order for opening position
+                            has_market_order = hasattr(self.exchange_client, 'place_market_order')
+                            if has_market_order:
+                                self.logger.log("Using market order to open position...", "INFO")
+                                market_result = await self.exchange_client.place_market_order(
+                                    self.config.contract_id,
+                                    self.config.quantity,
+                                    self.config.direction
+                                )
+                                
+                                if market_result.success:
+                                    filled_order = await self._wait_for_order_fill(market_result.order_id, timeout=30, is_open_order=True)
+                                    if not filled_order:
+                                        self.logger.log("Market order also failed, retrying in 30 seconds", "ERROR")
+                                        await asyncio.sleep(30)
+                                        continue
+                                else:
+                                    self.logger.log(f"Market order failed: {market_result.error_message}, retrying in 30 seconds", "ERROR")
+                                    await asyncio.sleep(30)
+                                    continue
+                            else:
+                                self.logger.log("Exchange does not support market orders, retrying in 30 seconds", "ERROR")
+                                await asyncio.sleep(30)
+                                continue
 
                     filled_price = filled_order.price
                     filled_quantity = filled_order.filled_size
@@ -861,14 +890,20 @@ class TradingBot:
         try:
             start_time = time.time()
             last_check_time = 0
+            websocket_filled = False
             
             while time.time() - start_time < timeout:
                 # Check if order is filled via WebSocket event
                 if self.order_filled_event.is_set():
+                    websocket_filled = True
+                    self.logger.log(f"WebSocket detected order {order_id} filled", "INFO")
                     # Get order info to get filled details
                     order_info = await self.exchange_client.get_order_info(order_id)
                     if order_info and order_info.status == 'FILLED':
+                        self.logger.log(f"Order {order_id} filled: {order_info.filled_size} @ {order_info.price}", "INFO")
                         return order_info
+                    elif order_info:
+                        self.logger.log(f"WebSocket filled but order status is {order_info.status}, continuing to check...", "WARNING")
 
                 # Check order status directly (with error handling)
                 try:
@@ -883,6 +918,9 @@ class TradingBot:
                         elif order_info.status == 'REJECTED':
                             self.logger.log(f"Order {order_id} was rejected", "ERROR")
                             return None
+                        elif order_info.status == 'OPEN':
+                            # Order is still open, continue waiting
+                            pass
                 except Exception as order_check_error:
                     # Log error but don't fail immediately - might be temporary API issue
                     current_time = time.time()
@@ -890,8 +928,20 @@ class TradingBot:
                         self.logger.log(f"Error checking order status: {order_check_error}", "WARNING")
                         last_check_time = current_time
 
-                await asyncio.sleep(5)  # Check every 5 seconds
+                await asyncio.sleep(2)  # Check every 2 seconds (more frequent)
 
+            # If we reach here, timeout occurred
+            if websocket_filled:
+                self.logger.log(f"CRITICAL: WebSocket detected fill but get_order_info timeout for {order_id}", "ERROR")
+                # Try one more time to get order info
+                try:
+                    order_info = await self.exchange_client.get_order_info(order_id)
+                    if order_info and order_info.status == 'FILLED':
+                        self.logger.log(f"Order {order_id} filled: {order_info.filled_size} @ {order_info.price}", "INFO")
+                        return order_info
+                except Exception as e:
+                    self.logger.log(f"Final order info check failed: {e}", "ERROR")
+            
             self.logger.log(f"Order {order_id} not filled within {timeout} seconds", "WARNING")
             return None
 

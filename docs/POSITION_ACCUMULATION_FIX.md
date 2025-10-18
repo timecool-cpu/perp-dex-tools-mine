@@ -4,7 +4,10 @@
 
 **严重问题**: 用户设置 `--quantity 0.05`，但实际仓位累积到 `0.2`，导致保证金不足和无限重试。
 
-**根本原因**: 平仓失败导致仓位累积，每次循环都会增加仓位大小。
+**根本原因**: 
+1. **订单状态检测问题**: WebSocket显示订单已成交，但`_wait_for_order_fill`方法没有正确检测到
+2. **重复下单**: 系统认为订单没成交，又下了一个市价单，导致仓位翻倍
+3. **平仓失败**: 平仓失败导致仓位累积，每次循环都会增加仓位大小
 
 ## 🔧 修复措施
 
@@ -51,7 +54,25 @@ if active_orders:
             await self.exchange_client.cancel_order(order_id)
 ```
 
-### 3. 改进平仓方法
+### 3. 修复订单状态检测问题
+
+**位置**: `trading_bot.py` - `_wait_for_order_fill` 方法
+
+**关键修复**:
+- **WebSocket状态跟踪**: 跟踪WebSocket是否检测到订单成交
+- **更频繁检查**: 从5秒改为2秒检查一次
+- **超时后重试**: 如果WebSocket检测到成交但API超时，进行最终重试
+- **仓位检查**: 在尝试市价单前检查仓位是否已存在
+
+```python
+# 检查仓位是否已存在，防止重复下单
+current_position = await self.exchange_client.get_account_positions()
+if current_position != 0:
+    self.logger.log(f"CRITICAL: Position already exists: {current_position}, order may have filled but not detected", "ERROR")
+    self.logger.log("Skipping market order to prevent double position", "WARNING")
+```
+
+### 4. 改进平仓方法
 
 **位置**: `trading_bot.py` - `_close_position_simple` 方法
 
@@ -76,7 +97,7 @@ else:
     return False
 ```
 
-### 4. 严格错误处理
+### 5. 严格错误处理
 
 **修复内容**:
 - 平仓失败时立即停止策略
@@ -94,7 +115,7 @@ if not close_result:
         return
 ```
 
-### 5. 紧急平仓脚本
+### 6. 紧急平仓脚本
 
 **新增文件**: `emergency_close_position.py`
 
