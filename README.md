@@ -2,6 +2,19 @@
 
 ---
 
+## ⚠️ 重要安全提醒
+
+**仓位累积问题**: 如果发现仓位大小与设置的quantity参数不符（如设置0.05但实际仓位是0.2），这表明存在仓位累积问题。请立即：
+
+1. **停止策略**: 按Ctrl+C停止运行
+2. **使用紧急平仓脚本**: `python emergency_close_position.py`
+3. **检查仓位**: 在交易所界面确认仓位状态
+4. **手动平仓**: 如需要，手动平仓所有仓位
+
+**原因**: 平仓失败导致仓位累积，每次循环都会增加仓位大小。
+
+---
+
 **English speakers**: Please read README_EN.md for the English version of this documentation.
 
 ### Hedge strategy quickstart (Python 3.11)

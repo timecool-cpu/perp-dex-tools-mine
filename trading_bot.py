@@ -640,37 +640,68 @@ class TradingBot:
                     # Check if we already have a position
                     current_position = await self.exchange_client.get_account_positions()
                     if current_position != 0:
-                        self.logger.log(f"Warning: Existing position detected: {current_position}", "WARNING")
-                        self.logger.log("Attempting to close existing position before starting new loop...", "INFO")
+                        self.logger.log(f"CRITICAL: Existing position detected: {current_position} (expected: 0)", "ERROR")
+                        self.logger.log("This indicates a serious issue - position not properly closed in previous loop!", "ERROR")
                         
-                        # Try to close existing position
+                        # Force close ALL existing positions regardless of size
+                        position_size = abs(current_position)
                         close_side = self.config.close_order_side
-                        close_result = await self._close_position_simple(abs(current_position), Decimal('0'))
+                        
+                        self.logger.log(f"Force closing position of size: {position_size}", "WARNING")
+                        close_result = await self._close_position_simple(position_size, Decimal('0'))
                         
                         if close_result:
-                            self.logger.log("Existing position closed successfully", "INFO")
-                            await asyncio.sleep(5)  # Wait a bit for position to update
+                            self.logger.log("Existing position force-closed successfully", "INFO")
+                            await asyncio.sleep(10)  # Wait longer for position to update
                             
-                            # Double-check position is actually closed
+                            # Triple-check position is actually closed
                             final_position = await self.exchange_client.get_account_positions()
                             if abs(final_position) > 0.001:
-                                self.logger.log(f"Position still exists after close attempt: {final_position}, waiting 30 seconds", "WARNING")
-                                await asyncio.sleep(30)
-                                continue
+                                self.logger.log(f"CRITICAL: Position still exists after force close: {final_position}", "ERROR")
+                                self.logger.log("Stopping strategy to prevent further position accumulation!", "ERROR")
+                                await self.graceful_shutdown("Position accumulation detected - manual intervention required")
+                                return
+                            else:
+                                self.logger.log("Position successfully closed, continuing with new loop", "INFO")
                         else:
-                            self.logger.log("Failed to close existing position, waiting 30 seconds before retrying", "WARNING")
-                            await asyncio.sleep(30)
-                            continue
+                            self.logger.log("CRITICAL: Failed to force close existing position", "ERROR")
+                            self.logger.log("Stopping strategy to prevent further position accumulation!", "ERROR")
+                            await self.graceful_shutdown("Failed to close existing position - manual intervention required")
+                            return
 
                     # Check for any active orders before placing new order
                     try:
                         active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
                         if active_orders:
-                            self.logger.log(f"Found {len(active_orders)} active orders, waiting for them to complete...", "WARNING")
-                            await asyncio.sleep(30)
-                            continue
+                            self.logger.log(f"CRITICAL: Found {len(active_orders)} active orders from previous loop", "WARNING")
+                            self.logger.log("This indicates orders were not properly handled in previous loop", "WARNING")
+                            
+                            # Cancel all active orders
+                            for order in active_orders:
+                                try:
+                                    order_id = order.get('order_id') if isinstance(order, dict) else getattr(order, 'order_id', None)
+                                    if order_id:
+                                        self.logger.log(f"Cancelling active order: {order_id}", "INFO")
+                                        await self.exchange_client.cancel_order(order_id)
+                                    else:
+                                        self.logger.log(f"Cannot get order_id from order: {order}", "WARNING")
+                                except Exception as cancel_error:
+                                    self.logger.log(f"Error cancelling order {order}: {cancel_error}", "WARNING")
+                            
+                            # Wait a bit for cancellations to process
+                            self.logger.log("Waiting 10 seconds for order cancellations to process...", "INFO")
+                            await asyncio.sleep(10)
+                            
+                            # Double-check that orders are cancelled
+                            remaining_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                            if remaining_orders:
+                                self.logger.log(f"WARNING: {len(remaining_orders)} orders still active after cancellation attempt", "WARNING")
+                                self.logger.log("Waiting additional 20 seconds...", "INFO")
+                                await asyncio.sleep(20)
+                            else:
+                                self.logger.log("All active orders successfully cancelled", "INFO")
                     except Exception as e:
-                        self.logger.log(f"Error checking active orders: {e}", "WARNING")
+                        self.logger.log(f"Error checking/cancelling active orders: {e}", "WARNING")
 
                     # Step 1: Place the initial order
                     self.logger.log("Step 1: Placing initial order...", "INFO")
@@ -751,17 +782,22 @@ class TradingBot:
                         self.logger.log("Position successfully closed!", "INFO")
                         self.logger.log(f"Loop #{loop_number} completed successfully", "INFO")
                     else:
-                        self.logger.log("Failed to close position automatically", "ERROR")
-                        # Check if position still exists and try to handle it
+                        self.logger.log("CRITICAL: Failed to close position automatically", "ERROR")
+                        # Check if position still exists
                         try:
                             current_position = await self.exchange_client.get_account_positions()
                             if abs(current_position) > 0.001:
-                                self.logger.log(f"Position still exists: {current_position}, will be handled in next loop", "WARNING")
+                                self.logger.log(f"CRITICAL: Position still exists: {current_position}", "ERROR")
+                                self.logger.log("Stopping strategy to prevent position accumulation!", "ERROR")
+                                await self.graceful_shutdown("Failed to close position - manual intervention required")
+                                return
                             else:
                                 self.logger.log("Position appears to be closed despite error", "INFO")
                         except Exception as e:
                             self.logger.log(f"Error checking position after close failure: {e}", "WARNING")
-                        # Continue to next loop even if close failed
+                            self.logger.log("Stopping strategy due to uncertainty about position state", "ERROR")
+                            await self.graceful_shutdown("Position state uncertain - manual intervention required")
+                            return
                     
 
                     
@@ -866,7 +902,34 @@ class TradingBot:
     async def _close_position_simple(self, quantity: Decimal, entry_price: Decimal) -> bool:
         """Close position using market order or limit order."""
         try:
-            close_side = self.config.close_order_side
+            # First, check and cancel any active orders before closing position
+            try:
+                active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                if active_orders:
+                    self.logger.log(f"Found {len(active_orders)} active orders before closing position", "WARNING")
+                    for order in active_orders:
+                        try:
+                            order_id = order.get('order_id') if isinstance(order, dict) else getattr(order, 'order_id', None)
+                            if order_id:
+                                self.logger.log(f"Cancelling active order before close: {order_id}", "INFO")
+                                await self.exchange_client.cancel_order(order_id)
+                        except Exception as cancel_error:
+                            self.logger.log(f"Error cancelling order {order}: {cancel_error}", "WARNING")
+                    await asyncio.sleep(5)  # Wait for cancellations to process
+            except Exception as e:
+                self.logger.log(f"Error checking active orders before close: {e}", "WARNING")
+            
+            # CRITICAL: Get actual position size from account, not from parameter
+            actual_position = await self.exchange_client.get_account_positions()
+            if actual_position == 0:
+                self.logger.log("No position to close", "INFO")
+                return True
+            
+            # Use actual position size for closing
+            close_quantity = abs(actual_position)
+            close_side = "sell" if actual_position > 0 else "buy"
+            
+            self.logger.log(f"CRITICAL: Closing actual position: {close_quantity} {close_side} (parameter was: {quantity})", "WARNING")
             
             # Check if exchange supports market orders
             has_market_order = hasattr(self.exchange_client, 'place_market_order')
@@ -876,7 +939,7 @@ class TradingBot:
                 self.logger.log("Using market order to close position", "INFO")
                 close_result = await self.exchange_client.place_market_order(
                     self.config.contract_id,
-                    quantity,
+                    close_quantity,
                     close_side
                 )
             else:
@@ -893,7 +956,7 @@ class TradingBot:
                 self.logger.log(f"Using limit order to close position @ {close_price}", "INFO")
                 close_result = await self.exchange_client.place_close_order(
                     self.config.contract_id,
-                    quantity,
+                    close_quantity,
                     close_price,
                     close_side
                 )
@@ -905,7 +968,16 @@ class TradingBot:
                 close_filled = await self._wait_for_order_fill(close_result.order_id, timeout=60, is_open_order=False)
                 if close_filled:
                     self.logger.log(f"Position closed: {close_filled.filled_size} @ {close_filled.price}", "INFO")
-                    return True
+                    
+                    # CRITICAL: Verify position is actually closed
+                    await asyncio.sleep(3)  # Wait for position update
+                    final_position = await self.exchange_client.get_account_positions()
+                    if abs(final_position) < 0.001:
+                        self.logger.log("Position close verified successfully", "INFO")
+                        return True
+                    else:
+                        self.logger.log(f"CRITICAL: Position still exists after close: {final_position}", "ERROR")
+                        return False
                 else:
                     self.logger.log("Close order not filled within 60 seconds, cancelling and retrying...", "WARNING")
                     
@@ -929,7 +1001,7 @@ class TradingBot:
                     
                     retry_result = await self.exchange_client.place_close_order(
                         self.config.contract_id,
-                        quantity,
+                        close_quantity,
                         retry_price,
                         close_side
                     )
@@ -939,7 +1011,16 @@ class TradingBot:
                         retry_filled = await self._wait_for_order_fill(retry_result.order_id, timeout=60, is_open_order=False)
                         if retry_filled:
                             self.logger.log(f"Position closed on retry: {retry_filled.filled_size} @ {retry_filled.price}", "INFO")
-                            return True
+                            
+                            # CRITICAL: Verify position is actually closed
+                            await asyncio.sleep(3)
+                            final_position = await self.exchange_client.get_account_positions()
+                            if abs(final_position) < 0.001:
+                                self.logger.log("Retry close verified successfully", "INFO")
+                                return True
+                            else:
+                                self.logger.log(f"CRITICAL: Position still exists after retry close: {final_position}", "ERROR")
+                                return False
                         else:
                             self.logger.log("Retry close order also failed, but position may have been closed", "WARNING")
                             # Wait a bit more for potential delayed fills
