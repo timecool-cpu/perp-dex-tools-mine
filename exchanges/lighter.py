@@ -387,6 +387,14 @@ class LighterClient(BaseExchangeClient):
             if self.current_order is not None:
                 order_status = self.current_order.status
 
+        # Check if current_order is available
+        if self.current_order is None:
+            return OrderResult(
+                success=False,
+                order_id=str(self.current_order_client_id) if self.current_order_client_id else "unknown",
+                error_message="Order was placed but current_order is None - WebSocket may not be connected"
+            )
+        
         return OrderResult(
             success=True,
             order_id=self.current_order.order_id,
@@ -496,17 +504,23 @@ class LighterClient(BaseExchangeClient):
             account_api = lighter.AccountApi(self.api_client)
             account_data = await account_api.account(by="index", value=str(self.account_index))
 
+            # Check if account data is valid
+            if not account_data or not account_data.accounts:
+                return None
+
             # Look for the specific order in account positions
-            for position in account_data.positions:
-                if position.symbol == self.config.ticker:
+            for position in account_data.accounts[0].positions:
+                if position.market_id == self.config.contract_id:
                     position_amt = abs(float(position.position))
                     if position_amt > 0.001:  # Only include significant positions
                         # Return a filled order info based on position
+                        # Note: Lighter AccountPosition doesn't have avg_price or entry_price
+                        # We'll use a placeholder price since this is just for status checking
                         return OrderInfo(
                             order_id=order_id,
                             side="buy" if float(position.position) > 0 else "sell",
                             size=Decimal(str(position_amt)),
-                            price=Decimal(str(position.avg_price)),
+                            price=Decimal('0'),  # Price not available from position data
                             status="FILLED",  # Positions indicate filled orders
                             filled_size=Decimal(str(position_amt)),
                             remaining_size=Decimal('0')

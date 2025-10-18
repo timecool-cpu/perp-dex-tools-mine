@@ -103,15 +103,31 @@ class TradingBot:
         def order_update_handler(message):
             """Handle order updates from WebSocket."""
             try:
-                # Check if this is for our contract
-                if message.get('contract_id') != self.config.contract_id:
-                    return
+                # Handle different message types from different exchanges
+                if hasattr(message, 'order_id'):
+                    # Lighter exchange sends OrderInfo objects
+                    order_id = message.order_id
+                    status = message.status
+                    side = message.side
+                    order_type = "OPEN" if side == self.config.direction else "CLOSE"
+                    filled_size = message.filled_size
+                    size = message.size
+                    price = message.price
+                    contract_id = self.config.contract_id  # Lighter doesn't send contract_id in OrderInfo
+                else:
+                    # Other exchanges send dictionary objects
+                    # Check if this is for our contract
+                    if message.get('contract_id') != self.config.contract_id:
+                        return
 
-                order_id = message.get('order_id')
-                status = message.get('status')
-                side = message.get('side', '')
-                order_type = message.get('order_type', '')
-                filled_size = Decimal(message.get('filled_size'))
+                    order_id = message.get('order_id')
+                    status = message.get('status')
+                    side = message.get('side', '')
+                    order_type = message.get('order_type', '')
+                    filled_size = Decimal(message.get('filled_size', 0))
+                    size = message.get('size')
+                    price = message.get('price')
+
                 if order_type == "OPEN":
                     self.current_order_status = status
 
@@ -126,8 +142,8 @@ class TradingBot:
                             self.order_filled_event.set()
 
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
-                                    f"{message.get('size')} @ {message.get('price')}", "INFO")
-                    self.logger.log_transaction(order_id, side, message.get('size'), message.get('price'), status)
+                                    f"{size} @ {price}", "INFO")
+                    self.logger.log_transaction(order_id, side, size, price, status)
                 elif status == "CANCELED":
                     if order_type == "OPEN":
                         self.order_filled_amount = filled_size
@@ -137,21 +153,21 @@ class TradingBot:
                             self.order_canceled_event.set()
 
                         if self.order_filled_amount > 0:
-                            self.logger.log_transaction(order_id, side, self.order_filled_amount, message.get('price'), status)
+                            self.logger.log_transaction(order_id, side, self.order_filled_amount, price, status)
                             
                     # PATCH
                     if self.config.exchange == "extended":
                         self.logger.log(f"[{order_type}] [{order_id}] {status} "
-                                        f"{Decimal(message.get('size')) - filled_size} @ {message.get('price')}", "INFO")
+                                        f"{Decimal(size) - filled_size} @ {price}", "INFO")
                     else:
                         self.logger.log(f"[{order_type}] [{order_id}] {status} "
-                                        f"{message.get('size')} @ {message.get('price')}", "INFO")
+                                        f"{size} @ {price}", "INFO")
                 elif status == "PARTIALLY_FILLED":
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
-                                    f"{filled_size} @ {message.get('price')}", "INFO")
+                                    f"{filled_size} @ {price}", "INFO")
                 else:
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
-                                    f"{message.get('size')} @ {message.get('price')}", "INFO")
+                                    f"{size} @ {price}", "INFO")
 
             except Exception as e:
                 self.logger.log(f"Error handling order update: {e}", "ERROR")
@@ -576,3 +592,379 @@ class TradingBot:
                 await self.exchange_client.disconnect()
             except Exception as e:
                 self.logger.log(f"Error disconnecting from exchange: {e}", "ERROR")
+
+    async def simple_run(self, hold_duration_minutes: int = 60, loop_count: int = -1):
+        """
+        Simple trading strategy: Place one order, hold for specified duration, then auto-close.
+        Runs in a loop until stopped or loop_count is reached.
+        
+        Args:
+            hold_duration_minutes: How long to hold the position in minutes (default: 60)
+            loop_count: Number of loops to run (-1 for infinite loop, default: -1)
+        """
+        try:
+            # Get contract attributes
+            self.config.contract_id, self.config.tick_size = await self.exchange_client.get_contract_attributes()
+
+            # Log configuration
+            self.logger.log("=== Simple Trading Strategy (Loop Mode) ===", "INFO")
+            self.logger.log(f"Ticker: {self.config.ticker}", "INFO")
+            self.logger.log(f"Contract ID: {self.config.contract_id}", "INFO")
+            self.logger.log(f"Quantity: {self.config.quantity}", "INFO")
+            self.logger.log(f"Direction: {self.config.direction}", "INFO")
+            self.logger.log(f"Exchange: {self.config.exchange}", "INFO")
+            self.logger.log(f"Hold Duration: {hold_duration_minutes} minutes", "INFO")
+            self.logger.log(f"Loop Mode: {'Infinite' if loop_count == -1 else f'{loop_count} loops'}", "INFO")
+            self.logger.log("==========================================", "INFO")
+
+            # Capture the running event loop for thread-safe callbacks
+            self.loop = asyncio.get_running_loop()
+            
+            # Connect to exchange
+            await self.exchange_client.connect()
+            await asyncio.sleep(5)  # Wait for connection to establish
+
+            # Main trading loop
+            loop_number = 0
+            while not self.shutdown_requested:
+                loop_number += 1
+                
+                # Check loop count limit
+                if loop_count != -1 and loop_number > loop_count:
+                    self.logger.log(f"Reached loop limit ({loop_count}), stopping strategy", "INFO")
+                    break
+                
+                self.logger.log(f"=== Starting Loop #{loop_number} ===", "INFO")
+                
+                try:
+                    # Check if we already have a position
+                    current_position = await self.exchange_client.get_account_positions()
+                    if current_position != 0:
+                        self.logger.log(f"Warning: Existing position detected: {current_position}", "WARNING")
+                        self.logger.log("Attempting to close existing position before starting new loop...", "INFO")
+                        
+                        # Try to close existing position
+                        close_side = self.config.close_order_side
+                        close_result = await self._close_position_simple(abs(current_position), Decimal('0'))
+                        
+                        if close_result:
+                            self.logger.log("Existing position closed successfully", "INFO")
+                            await asyncio.sleep(5)  # Wait a bit for position to update
+                            
+                            # Double-check position is actually closed
+                            final_position = await self.exchange_client.get_account_positions()
+                            if abs(final_position) > 0.001:
+                                self.logger.log(f"Position still exists after close attempt: {final_position}, waiting 30 seconds", "WARNING")
+                                await asyncio.sleep(30)
+                                continue
+                        else:
+                            self.logger.log("Failed to close existing position, waiting 30 seconds before retrying", "WARNING")
+                            await asyncio.sleep(30)
+                            continue
+
+                    # Check for any active orders before placing new order
+                    try:
+                        active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                        if active_orders:
+                            self.logger.log(f"Found {len(active_orders)} active orders, waiting for them to complete...", "WARNING")
+                            await asyncio.sleep(30)
+                            continue
+                    except Exception as e:
+                        self.logger.log(f"Error checking active orders: {e}", "WARNING")
+
+                    # Step 1: Place the initial order
+                    self.logger.log("Step 1: Placing initial order...", "INFO")
+                    order_result = await self._place_simple_order()
+                    
+                    if not order_result:
+                        self.logger.log("Failed to place initial order, retrying in 30 seconds", "ERROR")
+                        await asyncio.sleep(30)
+                        continue
+
+                    # Step 2: Wait for order to be filled
+                    self.logger.log("Step 2: Waiting for order to be filled...", "INFO")
+                    filled_order = await self._wait_for_order_fill(order_result.order_id, timeout=60, is_open_order=True)
+                    
+                    if not filled_order:
+                        self.logger.log("Order was not filled within 60 seconds, trying market order...", "WARNING")
+                        
+                        # Cancel the unfilled order first
+                        try:
+                            await self.exchange_client.cancel_order(order_result.order_id)
+                            self.logger.log(f"Cancelled unfilled open order: {order_result.order_id}", "INFO")
+                        except Exception as cancel_error:
+                            self.logger.log(f"Failed to cancel order: {cancel_error}", "WARNING")
+                        
+                        # Try market order for opening position
+                        has_market_order = hasattr(self.exchange_client, 'place_market_order')
+                        if has_market_order:
+                            self.logger.log("Using market order to open position...", "INFO")
+                            market_result = await self.exchange_client.place_market_order(
+                                self.config.contract_id,
+                                self.config.quantity,
+                                self.config.direction
+                            )
+                            
+                            if market_result.success:
+                                filled_order = await self._wait_for_order_fill(market_result.order_id, timeout=30, is_open_order=True)
+                                if not filled_order:
+                                    self.logger.log("Market order also failed, retrying in 30 seconds", "ERROR")
+                                    await asyncio.sleep(30)
+                                    continue
+                            else:
+                                self.logger.log(f"Market order failed: {market_result.error_message}, retrying in 30 seconds", "ERROR")
+                                await asyncio.sleep(30)
+                                continue
+                        else:
+                            self.logger.log("Exchange does not support market orders, retrying in 30 seconds", "ERROR")
+                            await asyncio.sleep(30)
+                            continue
+
+                    filled_price = filled_order.price
+                    filled_quantity = filled_order.filled_size
+                    self.logger.log(f"Order filled: {filled_quantity} @ {filled_price}", "INFO")
+
+                    # Step 3: Hold position for specified duration
+                    hold_duration_seconds = hold_duration_minutes * 60
+                    self.logger.log(f"Step 3: Holding position for {hold_duration_minutes} minutes...", "INFO")
+                    
+                    start_time = time.time()
+                    while time.time() - start_time < hold_duration_seconds and not self.shutdown_requested:
+                        remaining_time = hold_duration_seconds - (time.time() - start_time)
+                        remaining_minutes = remaining_time / 60
+                        
+                        # Log status every 10 minutes
+                        if int(remaining_time) % 600 == 0:
+                            self.logger.log(f"Position held for {int((time.time() - start_time)/60)} minutes. "
+                                          f"Remaining: {remaining_minutes:.1f} minutes", "INFO")
+                        
+                        await asyncio.sleep(60)  # Check every minute
+
+                    if self.shutdown_requested:
+                        break
+
+                    # Step 4: Auto-close position
+                    self.logger.log("Step 4: Auto-closing position...", "INFO")
+                    close_result = await self._close_position_simple(filled_quantity, filled_price)
+                    
+                    if close_result:
+                        self.logger.log("Position successfully closed!", "INFO")
+                        self.logger.log(f"Loop #{loop_number} completed successfully", "INFO")
+                    else:
+                        self.logger.log("Failed to close position automatically", "ERROR")
+                        # Check if position still exists and try to handle it
+                        try:
+                            current_position = await self.exchange_client.get_account_positions()
+                            if abs(current_position) > 0.001:
+                                self.logger.log(f"Position still exists: {current_position}, will be handled in next loop", "WARNING")
+                            else:
+                                self.logger.log("Position appears to be closed despite error", "INFO")
+                        except Exception as e:
+                            self.logger.log(f"Error checking position after close failure: {e}", "WARNING")
+                        # Continue to next loop even if close failed
+                    
+
+                    
+                except Exception as e:
+                    self.logger.log(f"Error in loop #{loop_number}: {e}", "ERROR")
+                    self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+                    self.logger.log("Waiting 30 seconds before retrying...", "INFO")
+                    await asyncio.sleep(30)
+                    continue
+
+            self.logger.log("Simple trading strategy loop completed", "INFO")
+
+        except KeyboardInterrupt:
+            self.logger.log("Simple strategy stopped by user", "INFO")
+            await self.graceful_shutdown("User interruption (Ctrl+C)")
+        except Exception as e:
+            self.logger.log(f"Error in simple strategy: {e}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            await self.graceful_shutdown(f"Error: {e}")
+            raise
+        finally:
+            try:
+                await self.exchange_client.disconnect()
+            except Exception as e:
+                self.logger.log(f"Error disconnecting from exchange: {e}", "ERROR")
+
+    async def _place_simple_order(self) -> Optional[object]:
+        """Place a simple order and return the result."""
+        try:
+            # Reset state
+            self.order_filled_event.clear()
+            self.current_order_status = 'OPEN'
+            self.order_filled_amount = 0.0
+
+            # Place the order
+            order_result = await self.exchange_client.place_open_order(
+                self.config.contract_id,
+                self.config.quantity,
+                self.config.direction
+            )
+
+            # Handle case where order_result might be None (some exchanges)
+            if order_result is None:
+                self.logger.log("Order placement returned None - this might indicate a connection issue", "ERROR")
+                return None
+
+            if not order_result.success:
+                self.logger.log(f"Failed to place order: {order_result.error_message}", "ERROR")
+                return None
+
+            self.logger.log(f"Order placed: {order_result.order_id} @ {order_result.price}", "INFO")
+            return order_result
+
+        except Exception as e:
+            self.logger.log(f"Error placing order: {e}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            return None
+
+    async def _wait_for_order_fill(self, order_id: str, timeout: int = 60, is_open_order: bool = True) -> Optional[object]:
+        """Wait for order to be filled within timeout."""
+        try:
+            start_time = time.time()
+            last_check_time = 0
+            
+            while time.time() - start_time < timeout:
+                # Check if order is filled via WebSocket event
+                if self.order_filled_event.is_set():
+                    # Get order info to get filled details
+                    order_info = await self.exchange_client.get_order_info(order_id)
+                    if order_info and order_info.status == 'FILLED':
+                        return order_info
+
+                # Check order status directly (with error handling)
+                try:
+                    order_info = await self.exchange_client.get_order_info(order_id)
+                    if order_info:
+                        if order_info.status == 'FILLED':
+                            self.logger.log(f"Order {order_id} filled: {order_info.filled_size} @ {order_info.price}", "INFO")
+                            return order_info
+                        elif order_info.status == 'CANCELED':
+                            self.logger.log(f"Order {order_id} was canceled", "WARNING")
+                            return None
+                        elif order_info.status == 'REJECTED':
+                            self.logger.log(f"Order {order_id} was rejected", "ERROR")
+                            return None
+                except Exception as order_check_error:
+                    # Log error but don't fail immediately - might be temporary API issue
+                    current_time = time.time()
+                    if current_time - last_check_time > 30:  # Log error only every 30 seconds
+                        self.logger.log(f"Error checking order status: {order_check_error}", "WARNING")
+                        last_check_time = current_time
+
+                await asyncio.sleep(5)  # Check every 5 seconds
+
+            self.logger.log(f"Order {order_id} not filled within {timeout} seconds", "WARNING")
+            return None
+
+        except Exception as e:
+            self.logger.log(f"Error waiting for order fill: {e}", "ERROR")
+            return None
+
+    async def _close_position_simple(self, quantity: Decimal, entry_price: Decimal) -> bool:
+        """Close position using market order or limit order."""
+        try:
+            close_side = self.config.close_order_side
+            
+            # Check if exchange supports market orders
+            has_market_order = hasattr(self.exchange_client, 'place_market_order')
+            
+            # Option 1: Use market order for immediate execution (if supported and boost mode)
+            if self.config.boost_mode and has_market_order:
+                self.logger.log("Using market order to close position", "INFO")
+                close_result = await self.exchange_client.place_market_order(
+                    self.config.contract_id,
+                    quantity,
+                    close_side
+                )
+            else:
+                # Option 2: Use limit order with slight price adjustment for better execution
+                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                
+                if close_side == 'sell':
+                    # For sell orders, use a price slightly below best ask for quick execution
+                    close_price = best_ask - self.config.tick_size
+                else:
+                    # For buy orders, use a price slightly above best bid for quick execution
+                    close_price = best_bid + self.config.tick_size
+                
+                self.logger.log(f"Using limit order to close position @ {close_price}", "INFO")
+                close_result = await self.exchange_client.place_close_order(
+                    self.config.contract_id,
+                    quantity,
+                    close_price,
+                    close_side
+                )
+
+            if close_result.success:
+                self.logger.log(f"Close order placed: {close_result.order_id}", "INFO")
+                
+                # Wait for close order to be filled
+                close_filled = await self._wait_for_order_fill(close_result.order_id, timeout=60, is_open_order=False)
+                if close_filled:
+                    self.logger.log(f"Position closed: {close_filled.filled_size} @ {close_filled.price}", "INFO")
+                    return True
+                else:
+                    self.logger.log("Close order not filled within 60 seconds, cancelling and retrying...", "WARNING")
+                    
+                    # Cancel the unfilled order
+                    try:
+                        await self.exchange_client.cancel_order(close_result.order_id)
+                        self.logger.log(f"Cancelled unfilled close order: {close_result.order_id}", "INFO")
+                    except Exception as cancel_error:
+                        self.logger.log(f"Failed to cancel order: {cancel_error}", "WARNING")
+                    
+                    # Retry with a more aggressive price
+                    self.logger.log("Retrying close order with more aggressive pricing...", "INFO")
+                    best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                    
+                    if close_side == 'sell':
+                        # For sell orders, use an even lower price for quick execution
+                        retry_price = best_bid - (self.config.tick_size * 2)
+                    else:
+                        # For buy orders, use an even higher price for quick execution
+                        retry_price = best_ask + (self.config.tick_size * 2)
+                    
+                    retry_result = await self.exchange_client.place_close_order(
+                        self.config.contract_id,
+                        quantity,
+                        retry_price,
+                        close_side
+                    )
+                    
+                    if retry_result.success:
+                        self.logger.log(f"Retry close order placed: {retry_result.order_id} @ {retry_price}", "INFO")
+                        retry_filled = await self._wait_for_order_fill(retry_result.order_id, timeout=60, is_open_order=False)
+                        if retry_filled:
+                            self.logger.log(f"Position closed on retry: {retry_filled.filled_size} @ {retry_filled.price}", "INFO")
+                            return True
+                        else:
+                            self.logger.log("Retry close order also failed, but position may have been closed", "WARNING")
+                            # Wait a bit more for potential delayed fills
+                            self.logger.log("Waiting additional 30 seconds for potential delayed fills...", "INFO")
+                            await asyncio.sleep(30)
+                            
+                            # Check if position is actually closed by checking account positions
+                            try:
+                                current_position = await self.exchange_client.get_account_positions()
+                                if abs(current_position) < 0.001:  # Position is effectively closed
+                                    self.logger.log("Position appears to be closed (checking account positions)", "INFO")
+                                    return True
+                                else:
+                                    self.logger.log(f"Position still exists: {current_position}", "WARNING")
+                                    return False
+                            except Exception as e:
+                                self.logger.log(f"Error checking position: {e}", "WARNING")
+                                return False
+                    else:
+                        self.logger.log(f"Failed to place retry close order: {retry_result.error_message}", "ERROR")
+                        return False
+            else:
+                self.logger.log(f"Failed to place close order: {close_result.error_message}", "ERROR")
+                return False
+
+        except Exception as e:
+            self.logger.log(f"Error closing position: {e}", "ERROR")
+            return False

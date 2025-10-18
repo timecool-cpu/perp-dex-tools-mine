@@ -285,6 +285,74 @@ class GrvtClient(BaseExchangeClient):
         else:
             return order_info
 
+    async def place_market_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
+        """Place a market order with GRVT using official SDK."""
+        try:
+            # Get current market prices
+            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+            if best_bid <= 0 or best_ask <= 0:
+                return OrderResult(success=False, error_message='Invalid bid/ask prices')
+
+            # For market orders, use very aggressive pricing to ensure immediate execution
+            if direction.lower() == 'buy':
+                # For buy market orders, use a price well above best ask
+                market_price = best_ask * Decimal('1.01')  # 1% above best ask
+                side = 'buy'
+            elif direction.lower() == 'sell':
+                # For sell market orders, use a price well below best bid
+                market_price = best_bid * Decimal('0.99')  # 1% below best bid
+                side = 'sell'
+            else:
+                return OrderResult(success=False, error_message=f'Invalid direction: {direction}')
+
+            # Round to tick size
+            market_price = self.round_to_tick(market_price)
+
+            # Place the market order using GRVT SDK (without post_only to allow taker)
+            order_result = self.rest_client.create_limit_order(
+                symbol=contract_id,
+                side=side,
+                amount=quantity,
+                price=market_price,
+                params={
+                    'post_only': False,  # Allow taker orders for market execution
+                    'order_duration_secs': 30 * 86400 - 1,  # GRVT SDK: signature expired cap is 30 days
+                }
+            )
+
+            if not order_result:
+                return OrderResult(success=False, error_message='Failed to place market order')
+
+            client_order_id = order_result.get('metadata').get('client_order_id')
+            order_status = order_result.get('state').get('status')
+            order_status_start_time = time.time()
+            
+            # Wait for order to be processed
+            order_info = await self.get_order_info(client_order_id=client_order_id)
+            if order_info is not None:
+                order_status = order_info.status
+
+            while order_status in ['PENDING'] and time.time() - order_status_start_time < 10:
+                await asyncio.sleep(0.05)
+                order_info = await self.get_order_info(client_order_id=client_order_id)
+                if order_info is not None:
+                    order_status = order_info.status
+
+            if order_status == 'PENDING':
+                return OrderResult(success=False, error_message='Market order not processed after 10 seconds')
+            else:
+                return OrderResult(
+                    success=True,
+                    order_id=order_info.order_id,
+                    side=side,
+                    size=quantity,
+                    price=market_price,
+                    status=order_status
+                )
+
+        except Exception as e:
+            return OrderResult(success=False, error_message=f'Error placing market order: {e}')
+
     async def get_order_price(self, direction: str) -> Decimal:
         """Get the price of an order with GRVT using official SDK."""
         best_bid, best_ask = await self.fetch_bbo_prices(self.config.contract_id)
