@@ -51,6 +51,8 @@ class GrvtClient(BaseExchangeClient):
         self._order_update_handler = None
         self._ws_client = None
         self._order_update_callback = None
+        self._connection_retry_task = None
+        self._is_connected = False
 
     def _initialize_grvt_clients(self) -> None:
         """Initialize the GRVT REST and WebSocket clients."""
@@ -79,53 +81,107 @@ class GrvtClient(BaseExchangeClient):
             raise ValueError(f"Missing required environment variables: {missing_vars}")
 
     async def connect(self) -> None:
-        """Connect to GRVT WebSocket."""
-        try:
-            # Initialize WebSocket client - match the working test implementation
-            loop = asyncio.get_running_loop()
+        """Connect to GRVT WebSocket with retry mechanism."""
+        max_retries = 3
+        retry_delay = 5
+        
+        for attempt in range(max_retries):
+            try:
+                # Initialize WebSocket client - match the working test implementation
+                loop = asyncio.get_running_loop()
 
-            # Import logger from pysdk like in the test file
-            from pysdk.grvt_ccxt_logging_selector import logger
+                # Import logger from pysdk like in the test file
+                from pysdk.grvt_ccxt_logging_selector import logger
 
-            # Parameters for GRVT SDK - match test file structure
-            parameters = {
-                'api_key': self.api_key,
-                'trading_account_id': self.trading_account_id,
-                'api_ws_version': 'v1',
-                'private_key': self.private_key
-            }
+                # Parameters for GRVT SDK - match test file structure
+                parameters = {
+                    'api_key': self.api_key,
+                    'trading_account_id': self.trading_account_id,
+                    'api_ws_version': 'v1',
+                    'private_key': self.private_key
+                }
 
-            self._ws_client = GrvtCcxtWS(
-                env=self.env,
-                loop=loop,
-                logger=logger,  # Add logger parameter like in test file
-                parameters=parameters
-            )
+                self._ws_client = GrvtCcxtWS(
+                    env=self.env,
+                    loop=loop,
+                    logger=logger,  # Add logger parameter like in test file
+                    parameters=parameters
+                )
 
-            # Initialize and connect
-            await self._ws_client.initialize()
-            await asyncio.sleep(2)  # Wait for connection to establish
+                # Initialize and connect
+                await self._ws_client.initialize()
+                await asyncio.sleep(2)  # Wait for connection to establish
 
-            # If an order update callback was set before connect, subscribe now
-            if self._order_update_callback is not None:
-                asyncio.create_task(self._subscribe_to_orders(self._order_update_callback))
-                self.logger.log(f"Deferred subscription started for {self.config.contract_id}", "INFO")
+                # If an order update callback was set before connect, subscribe now
+                if self._order_update_callback is not None:
+                    asyncio.create_task(self._subscribe_to_orders(self._order_update_callback))
+                    self.logger.log(f"Deferred subscription started for {self.config.contract_id}", "INFO")
 
-        except Exception as e:
-            self.logger.log(f"Error connecting to GRVT WebSocket: {e}", "ERROR")
-            raise
+                self.logger.log(f"GRVT WebSocket connected successfully (attempt {attempt + 1})", "INFO")
+                self._is_connected = True
+                return  # Success, exit retry loop
+
+            except Exception as e:
+                self.logger.log(f"Error connecting to GRVT WebSocket (attempt {attempt + 1}/{max_retries}): {e}", "ERROR")
+                
+                # Clean up failed connection
+                if self._ws_client:
+                    try:
+                        await self._ws_client.__aexit__(None, None, None)
+                    except:
+                        pass
+                    self._ws_client = None
+                
+                if attempt < max_retries - 1:
+                    self.logger.log(f"Retrying connection in {retry_delay} seconds...", "WARNING")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    self.logger.log("All connection attempts failed", "ERROR")
+                    raise
 
     async def disconnect(self) -> None:
         """Disconnect from GRVT."""
         try:
             if self._ws_client:
-                await self._ws_client.__aexit__()
+                try:
+                    # Properly close WebSocket connection
+                    await self._ws_client.__aexit__(None, None, None)
+                except Exception as ws_error:
+                    self.logger.log(f"Error closing WebSocket: {ws_error}", "WARNING")
+                finally:
+                    self._ws_client = None
+                    self._is_connected = False
+            
+            # Close REST client session if it exists
+            if hasattr(self.rest_client, 'close'):
+                try:
+                    await self.rest_client.close()
+                except Exception as rest_error:
+                    self.logger.log(f"Error closing REST client: {rest_error}", "WARNING")
+                    
         except Exception as e:
             self.logger.log(f"Error during GRVT disconnect: {e}", "ERROR")
 
     def get_exchange_name(self) -> str:
         """Get the exchange name."""
         return "grvt"
+    
+    def is_websocket_connected(self) -> bool:
+        """Check if WebSocket is connected."""
+        return self._is_connected and self._ws_client is not None
+    
+    async def ensure_websocket_connection(self) -> bool:
+        """Ensure WebSocket connection is active, reconnect if necessary."""
+        if not self.is_websocket_connected():
+            self.logger.log("WebSocket not connected, attempting to reconnect...", "WARNING")
+            try:
+                await self.connect()
+                return True
+            except Exception as e:
+                self.logger.log(f"Failed to reconnect WebSocket: {e}", "ERROR")
+                return False
+        return True
 
     def setup_order_update_handler(self, handler) -> None:
         """Setup order update handler for WebSocket."""

@@ -97,6 +97,26 @@ class TradingBot:
 
         except Exception as e:
             self.logger.log(f"Error during graceful shutdown: {e}", "ERROR")
+    
+    async def handle_websocket_error(self, error: Exception):
+        """Handle WebSocket connection errors."""
+        self.logger.log(f"WebSocket error detected: {error}", "ERROR")
+        
+        # Check if we can reconnect
+        if hasattr(self.exchange_client, 'ensure_websocket_connection'):
+            try:
+                success = await self.exchange_client.ensure_websocket_connection()
+                if success:
+                    self.logger.log("WebSocket reconnected successfully", "INFO")
+                else:
+                    self.logger.log("Failed to reconnect WebSocket, stopping strategy", "ERROR")
+                    await self.graceful_shutdown("WebSocket connection failed")
+            except Exception as reconnect_error:
+                self.logger.log(f"Error during WebSocket reconnection: {reconnect_error}", "ERROR")
+                await self.graceful_shutdown("WebSocket reconnection failed")
+        else:
+            self.logger.log("Exchange does not support WebSocket reconnection, stopping strategy", "ERROR")
+            await self.graceful_shutdown("WebSocket connection lost")
 
     def _setup_websocket_handlers(self):
         """Setup WebSocket handlers for order updates."""
@@ -172,6 +192,14 @@ class TradingBot:
             except Exception as e:
                 self.logger.log(f"Error handling order update: {e}", "ERROR")
                 self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+                
+                # Check if this is a WebSocket connection error
+                if "ConnectionClosed" in str(e) or "websocket" in str(e).lower():
+                    if self.loop is not None:
+                        # Schedule WebSocket error handling in the event loop
+                        self.loop.call_soon_threadsafe(
+                            lambda: asyncio.create_task(self.handle_websocket_error(e))
+                        )
 
         # Setup order update handler
         self.exchange_client.setup_order_update_handler(order_update_handler)
