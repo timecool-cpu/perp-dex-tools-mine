@@ -146,7 +146,10 @@ class GrvtClient(BaseExchangeClient):
             if self._ws_client:
                 try:
                     # Properly close WebSocket connection
-                    await self._ws_client.__aexit__(None, None, None)
+                    if hasattr(self._ws_client, 'close'):
+                        await self._ws_client.close()
+                    else:
+                        await self._ws_client.__aexit__()
                 except Exception as ws_error:
                     self.logger.log(f"Error closing WebSocket: {ws_error}", "WARNING")
                 finally:
@@ -154,7 +157,13 @@ class GrvtClient(BaseExchangeClient):
                     self._is_connected = False
             
             # Close REST client session if it exists
-            if hasattr(self.rest_client, 'close'):
+            if hasattr(self.rest_client, '_session') and self.rest_client._session is not None:
+                try:
+                    await self.rest_client._session.close()
+                    self.logger.log("REST client session closed", "INFO")
+                except Exception as rest_error:
+                    self.logger.log(f"Error closing REST client session: {rest_error}", "WARNING")
+            elif hasattr(self.rest_client, 'close'):
                 try:
                     await self.rest_client.close()
                 except Exception as rest_error:
@@ -316,6 +325,45 @@ class GrvtClient(BaseExchangeClient):
             price=price,
             params={
                 'post_only': True,
+                'reduce_only': True,  # CRITICAL: This ensures the order only reduces position, not opens new one
+                'order_duration_secs': 30 * 86400 - 1, # GRVT SDK: signature expired cap is 30 days (default 1 day)
+            }
+        )
+        if not order_result:
+            raise Exception(f"[OPEN] Error placing order")
+
+        client_order_id = order_result.get('metadata').get('client_order_id')
+        order_status = order_result.get('state').get('status')
+        order_status_start_time = time.time()
+        order_info = await self.get_order_info(client_order_id=client_order_id)
+        if order_info is not None:
+            order_status = order_info.status
+
+        while order_status in ['PENDING'] and time.time() - order_status_start_time < 10:
+            # Check order status after a short delay
+            await asyncio.sleep(0.05)
+            order_info = await self.get_order_info(client_order_id=client_order_id)
+            if order_info is not None:
+                order_status = order_info.status
+
+        if order_status == 'PENDING':
+            raise Exception('Paradex Server Error: Order not processed after 10 seconds')
+        else:
+            return order_info
+
+    async def place_open_post_only_order(self, contract_id: str, quantity: Decimal, price: Decimal,
+                                       side: str) -> OrderResult:
+        """Place a post only order for opening position (without reduce_only)."""
+        
+        # Place the order using GRVT SDK
+        order_result = self.rest_client.create_limit_order(
+            symbol=contract_id,
+            side=side,
+            amount=quantity,
+            price=price,
+            params={
+                'post_only': True,
+                'reduce_only': False,  # This allows opening new positions
                 'order_duration_secs': 30 * 86400 - 1, # GRVT SDK: signature expired cap is 30 days (default 1 day)
             }
         )
@@ -342,7 +390,7 @@ class GrvtClient(BaseExchangeClient):
             return order_info
 
     async def place_market_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
-        """Place a market order with GRVT using official SDK."""
+        """Place a market order for opening position (without reduce_only)."""
         try:
             # Get current market prices
             best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
@@ -372,6 +420,7 @@ class GrvtClient(BaseExchangeClient):
                 price=market_price,
                 params={
                     'post_only': False,  # Allow taker orders for market execution
+                    'reduce_only': False,  # This allows opening new positions
                     'order_duration_secs': 30 * 86400 - 1,  # GRVT SDK: signature expired cap is 30 days
                 }
             )
@@ -408,6 +457,75 @@ class GrvtClient(BaseExchangeClient):
 
         except Exception as e:
             return OrderResult(success=False, error_message=f'Error placing market order: {e}')
+
+    async def place_close_market_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
+        """Place a market order for closing position (with reduce_only)."""
+        try:
+            # Get current market prices
+            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+            if best_bid <= 0 or best_ask <= 0:
+                return OrderResult(success=False, error_message='Invalid bid/ask prices')
+
+            # For market orders, use very aggressive pricing to ensure immediate execution
+            if direction.lower() == 'buy':
+                # For buy market orders, use a price well above best ask
+                market_price = best_ask * Decimal('1.01')  # 1% above best ask
+                side = 'buy'
+            elif direction.lower() == 'sell':
+                # For sell market orders, use a price well below best bid
+                market_price = best_bid * Decimal('0.99')  # 1% below best bid
+                side = 'sell'
+            else:
+                return OrderResult(success=False, error_message=f'Invalid direction: {direction}')
+
+            # Round to tick size
+            market_price = self.round_to_tick(market_price)
+
+            # Place the market order using GRVT SDK (without post_only to allow taker)
+            order_result = self.rest_client.create_limit_order(
+                symbol=contract_id,
+                side=side,
+                amount=quantity,
+                price=market_price,
+                params={
+                    'post_only': False,  # Allow taker orders for market execution
+                    'reduce_only': True,  # This ensures the order only reduces position, not opens new one
+                    'order_duration_secs': 30 * 86400 - 1,  # GRVT SDK: signature expired cap is 30 days
+                }
+            )
+
+            if not order_result:
+                return OrderResult(success=False, error_message='Failed to place close market order')
+
+            client_order_id = order_result.get('metadata').get('client_order_id')
+            order_status = order_result.get('state').get('status')
+            order_status_start_time = time.time()
+            
+            # Wait for order to be processed
+            order_info = await self.get_order_info(client_order_id=client_order_id)
+            if order_info is not None:
+                order_status = order_info.status
+
+            while order_status in ['PENDING'] and time.time() - order_status_start_time < 10:
+                await asyncio.sleep(0.05)
+                order_info = await self.get_order_info(client_order_id=client_order_id)
+                if order_info is not None:
+                    order_status = order_info.status
+
+            if order_status == 'PENDING':
+                return OrderResult(success=False, error_message='Close market order not processed after 10 seconds')
+            else:
+                return OrderResult(
+                    success=True,
+                    order_id=order_info.order_id,
+                    side=side,
+                    size=quantity,
+                    price=market_price,
+                    status=order_status
+                )
+
+        except Exception as e:
+            return OrderResult(success=False, error_message=f'Error placing close market order: {e}')
 
     async def get_order_price(self, direction: str) -> Decimal:
         """Get the price of an order with GRVT using official SDK."""
@@ -454,7 +572,7 @@ class GrvtClient(BaseExchangeClient):
 
             # Place the order using GRVT SDK
             try:
-                order_info = await self.place_post_only_order(contract_id, quantity, order_price, direction)
+                order_info = await self.place_open_post_only_order(contract_id, quantity, order_price, direction)
             except Exception as e:
                 self.logger.log(f"[OPEN] Error placing order: {e}", "ERROR")
                 continue
@@ -497,13 +615,21 @@ class GrvtClient(BaseExchangeClient):
                 else:
                     active_close_orders = current_close_orders
 
-            # Adjust price to ensure maker order
+            # Adjust price to ensure maker order and better execution
             best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
 
-            if side == 'sell' and price <= best_bid:
-                adjusted_price = best_bid + self.config.tick_size
-            elif side == 'buy' and price >= best_ask:
-                adjusted_price = best_ask - self.config.tick_size
+            if side == 'sell':
+                # For sell orders, use a price slightly below best ask for quick execution
+                if price >= best_ask:
+                    adjusted_price = best_ask - self.config.tick_size
+                else:
+                    adjusted_price = price
+            elif side == 'buy':
+                # For buy orders, use a price slightly above best bid for quick execution
+                if price <= best_bid:
+                    adjusted_price = best_bid + self.config.tick_size
+                else:
+                    adjusted_price = price
             else:
                 adjusted_price = price
 
@@ -624,13 +750,15 @@ class GrvtClient(BaseExchangeClient):
 
     @query_retry(reraise=True)
     async def get_account_positions(self) -> Decimal:
-        """Get account positions."""
+        """Get account positions with direction."""
         # Get positions using GRVT SDK
         positions = self.rest_client.fetch_positions()
 
         for position in positions:
             if position.get('instrument') == self.config.contract_id:
-                return abs(Decimal(position.get('size', 0)))
+                size = Decimal(position.get('size', 0))
+                # Return signed position size (positive for long, negative for short)
+                return size
 
         return Decimal(0)
 

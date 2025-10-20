@@ -80,6 +80,8 @@ class TradingBot:
         self.order_filled_event = asyncio.Event()
         self.order_canceled_event = asyncio.Event()
         self.shutdown_requested = False
+        self.order_filled_amount = 0.0
+        self.order_filled_price = Decimal('0')
         self.loop = None
 
         # Register order callback
@@ -154,11 +156,18 @@ class TradingBot:
                 if status == 'FILLED':
                     if order_type == "OPEN":
                         self.order_filled_amount = filled_size
+                        self.order_filled_price = price  # Store price for later use
                         # Ensure thread-safe interaction with asyncio event loop
                         if self.loop is not None:
                             self.loop.call_soon_threadsafe(self.order_filled_event.set)
                         else:
                             # Fallback (should not happen after run() starts)
+                            self.order_filled_event.set()
+                    elif order_type == "CLOSE":
+                        # For close orders, also set the event to indicate fill
+                        if self.loop is not None:
+                            self.loop.call_soon_threadsafe(self.order_filled_event.set)
+                        else:
                             self.order_filled_event.set()
 
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
@@ -185,6 +194,16 @@ class TradingBot:
                 elif status == "PARTIALLY_FILLED":
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
                                     f"{filled_size} @ {price}", "INFO")
+                    
+                    # Handle partial fills for open orders
+                    if order_type == "OPEN":
+                        self.order_filled_amount = filled_size
+                        self.order_filled_price = price
+                        # Set event for partial fill too
+                        if self.loop is not None:
+                            self.loop.call_soon_threadsafe(self.order_filled_event.set)
+                        else:
+                            self.order_filled_event.set()
                 else:
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
                                     f"{size} @ {price}", "INFO")
@@ -281,8 +300,6 @@ class TradingBot:
                     self.config.close_order_side
                 )
             else:
-                self.last_open_order_time = time.time()
-                # Place close order
                 close_side = self.config.close_order_side
                 if close_side == 'sell':
                     close_price = filled_price * (1 + self.config.take_profit/100)
@@ -298,11 +315,11 @@ class TradingBot:
                 if self.config.exchange == "lighter":
                     await asyncio.sleep(1)
 
-                if not close_order_result.success:
-                    self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
-                    raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
+            if not close_order_result.success:
+                self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
+                raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
 
-                return True
+            return True
 
         else:
             new_order_price = await self.exchange_client.get_order_price(self.config.direction)
@@ -783,9 +800,22 @@ class TradingBot:
                             except Exception as cancel_error:
                                 self.logger.log(f"Failed to cancel order: {cancel_error}", "WARNING")
                             
-                            # Try market order for opening position
+                            # 额外验证取消状态，避免取消未成功导致重复开仓
+                            try:
+                                order_info_after_cancel = await self.exchange_client.get_order_info(order_result.order_id)
+                                if order_info_after_cancel and order_info_after_cancel.status == 'FILLED':
+                                    self.logger.log(f"Order {order_result.order_id} actually filled while canceling: {order_info_after_cancel.filled_size} @ {order_info_after_cancel.price}", "INFO")
+                                    filled_order = order_info_after_cancel
+                                elif order_info_after_cancel and order_info_after_cancel.status == 'OPEN':
+                                    self.logger.log("Open order still active after cancel; skipping market order to prevent double position", "WARNING")
+                                    await asyncio.sleep(30)
+                                    continue
+                            except Exception as verify_error:
+                                self.logger.log(f"Error verifying cancel status: {verify_error}", "WARNING")
+                            
+                            # Try market order for opening position（仅在确认取消成功或订单不再活跃时）
                             has_market_order = hasattr(self.exchange_client, 'place_market_order')
-                            if has_market_order:
+                            if has_market_order and not filled_order:
                                 self.logger.log("Using market order to open position...", "INFO")
                                 market_result = await self.exchange_client.place_market_order(
                                     self.config.contract_id,
@@ -803,14 +833,20 @@ class TradingBot:
                                     self.logger.log(f"Market order failed: {market_result.error_message}, retrying in 30 seconds", "ERROR")
                                     await asyncio.sleep(30)
                                     continue
-                            else:
+                            elif not has_market_order:
                                 self.logger.log("Exchange does not support market orders, retrying in 30 seconds", "ERROR")
                                 await asyncio.sleep(30)
                                 continue
 
                     filled_price = filled_order.price
                     filled_quantity = filled_order.filled_size
-                    self.logger.log(f"Order filled: {filled_quantity} @ {filled_price}", "INFO")
+                    
+                    # Check if this is a partial fill
+                    if filled_order.status == 'PARTIALLY_FILLED':
+                        self.logger.log(f"WARNING: Order partially filled: {filled_quantity} @ {filled_price} (requested: {self.config.quantity})", "WARNING")
+                        self.logger.log("Continuing with partial position - this may affect strategy performance", "WARNING")
+                    else:
+                        self.logger.log(f"Order filled: {filled_quantity} @ {filled_price}", "INFO")
 
                     # Step 3: Hold position for specified duration
                     hold_duration_seconds = hold_duration_minutes * 60
@@ -925,13 +961,24 @@ class TradingBot:
                 if self.order_filled_event.is_set():
                     websocket_filled = True
                     self.logger.log(f"WebSocket detected order {order_id} filled", "INFO")
-                    # Get order info to get filled details
-                    order_info = await self.exchange_client.get_order_info(order_id)
-                    if order_info and order_info.status == 'FILLED':
-                        self.logger.log(f"Order {order_id} filled: {order_info.filled_size} @ {order_info.price}", "INFO")
-                        return order_info
-                    elif order_info:
-                        self.logger.log(f"WebSocket filled but order status is {order_info.status}, continuing to check...", "WARNING")
+                    
+                    # If WebSocket says filled, trust it and return success
+                    # Don't rely on get_order_info which might be inconsistent
+                    self.logger.log(f"Order {order_id} filled according to WebSocket", "INFO")
+                    
+                    # Create a mock order info object for WebSocket fills
+                    class MockOrderInfo:
+                        def __init__(self, order_id, filled_size, price):
+                            self.order_id = order_id
+                            self.filled_size = filled_size
+                            self.price = price
+                            self.status = 'FILLED'
+                    
+                    # Use the filled amount and price from WebSocket event
+                    filled_size = getattr(self, 'order_filled_amount', self.config.quantity)
+                    filled_price = getattr(self, 'order_filled_price', Decimal('0'))
+                    mock_order = MockOrderInfo(order_id, filled_size, filled_price)
+                    return mock_order
 
                 # Check order status directly (with error handling)
                 try:
@@ -939,6 +986,10 @@ class TradingBot:
                     if order_info:
                         if order_info.status == 'FILLED':
                             self.logger.log(f"Order {order_id} filled: {order_info.filled_size} @ {order_info.price}", "INFO")
+                            return order_info
+                        elif order_info.status == 'PARTIALLY_FILLED':
+                            self.logger.log(f"Order {order_id} partially filled: {order_info.filled_size} @ {order_info.price}", "WARNING")
+                            # 直接使用交易所返回的部分成交信息，避免依赖 WebSocket 状态
                             return order_info
                         elif order_info.status == 'CANCELED':
                             self.logger.log(f"Order {order_id} was canceled", "WARNING")
@@ -1009,11 +1060,24 @@ class TradingBot:
             
             self.logger.log(f"CRITICAL: Closing actual position: {close_quantity} {close_side} (parameter was: {quantity})", "WARNING")
             
-            # Check if exchange supports market orders
-            has_market_order = hasattr(self.exchange_client, 'place_market_order')
+            # Check if this is a partial position
+            if abs(actual_position) != abs(quantity):
+                self.logger.log(f"WARNING: Position size mismatch - actual: {actual_position}, expected: {quantity}", "WARNING")
+                self.logger.log("This may be due to partial fills or previous incomplete closes", "WARNING")
             
-            # Option 1: Use market order for immediate execution (if supported and boost mode)
-            if self.config.boost_mode and has_market_order:
+            # Check if exchange supports market orders
+            has_market_order = hasattr(self.exchange_client, 'place_close_market_order')
+            has_general_market_order = hasattr(self.exchange_client, 'place_market_order')
+            
+            # Option 1: Use market order for immediate execution (preferred for closing)
+            if has_market_order:
+                self.logger.log("Using close market order to close position", "INFO")
+                close_result = await self.exchange_client.place_close_market_order(
+                    self.config.contract_id,
+                    close_quantity,
+                    close_side
+                )
+            elif has_general_market_order:
                 self.logger.log("Using market order to close position", "INFO")
                 close_result = await self.exchange_client.place_market_order(
                     self.config.contract_id,
@@ -1025,11 +1089,11 @@ class TradingBot:
                 best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
                 
                 if close_side == 'sell':
-                    # For sell orders, use a price slightly below best ask for quick execution
-                    close_price = best_ask - self.config.tick_size
+                    # For sell orders, cross the spread to the bid for quick execution
+                    close_price = best_bid
                 else:
-                    # For buy orders, use a price slightly above best bid for quick execution
-                    close_price = best_bid + self.config.tick_size
+                    # For buy orders, cross the spread to the ask for quick execution
+                    close_price = best_ask
                 
                 self.logger.log(f"Using limit order to close position @ {close_price}", "INFO")
                 close_result = await self.exchange_client.place_close_order(
@@ -1048,13 +1112,14 @@ class TradingBot:
                     self.logger.log(f"Position closed: {close_filled.filled_size} @ {close_filled.price}", "INFO")
                     
                     # CRITICAL: Verify position is actually closed
-                    await asyncio.sleep(3)  # Wait for position update
+                    await asyncio.sleep(5)  # Wait longer for position update
                     final_position = await self.exchange_client.get_account_positions()
                     if abs(final_position) < 0.001:
                         self.logger.log("Position close verified successfully", "INFO")
                         return True
                     else:
                         self.logger.log(f"CRITICAL: Position still exists after close: {final_position}", "ERROR")
+                        self.logger.log("WebSocket showed filled but position not closed - possible partial fill or error", "ERROR")
                         return False
                 else:
                     self.logger.log("Close order not filled within 60 seconds, cancelling and retrying...", "WARNING")
@@ -1091,13 +1156,14 @@ class TradingBot:
                             self.logger.log(f"Position closed on retry: {retry_filled.filled_size} @ {retry_filled.price}", "INFO")
                             
                             # CRITICAL: Verify position is actually closed
-                            await asyncio.sleep(3)
+                            await asyncio.sleep(5)  # Wait longer for position update
                             final_position = await self.exchange_client.get_account_positions()
                             if abs(final_position) < 0.001:
                                 self.logger.log("Retry close verified successfully", "INFO")
                                 return True
                             else:
                                 self.logger.log(f"CRITICAL: Position still exists after retry close: {final_position}", "ERROR")
+                                self.logger.log("WebSocket showed filled but position not closed - possible partial fill or error", "ERROR")
                                 return False
                         else:
                             self.logger.log("Retry close order also failed, but position may have been closed", "WARNING")
@@ -1113,7 +1179,8 @@ class TradingBot:
                                     return True
                                 else:
                                     self.logger.log(f"Position still exists: {current_position}", "WARNING")
-                                    return False
+                                    # Try force close as last resort
+                                    return await self._force_close_position(current_position)
                             except Exception as e:
                                 self.logger.log(f"Error checking position: {e}", "WARNING")
                                 return False
@@ -1126,4 +1193,53 @@ class TradingBot:
 
         except Exception as e:
             self.logger.log(f"Error closing position: {e}", "ERROR")
+            return False
+    
+    async def _force_close_position(self, position_size: Decimal) -> bool:
+        """Force close position using market order if available."""
+        try:
+            self.logger.log(f"Attempting force close for position: {position_size}", "WARNING")
+            
+            # Determine close side
+            close_side = "sell" if position_size > 0 else "buy"
+            close_quantity = abs(position_size)
+            
+            # Try market order if available
+            if hasattr(self.exchange_client, 'place_close_market_order'):
+                self.logger.log("Using close market order for force close", "WARNING")
+                market_result = await self.exchange_client.place_close_market_order(
+                    self.config.contract_id,
+                    close_quantity,
+                    close_side
+                )
+            elif hasattr(self.exchange_client, 'place_market_order'):
+                self.logger.log("Using market order for force close", "WARNING")
+                market_result = await self.exchange_client.place_market_order(
+                    self.config.contract_id,
+                    close_quantity,
+                    close_side
+                )
+                
+                if market_result and market_result.success:
+                    self.logger.log(f"Force close market order placed: {market_result.order_id}", "WARNING")
+                    await asyncio.sleep(10)  # Wait for execution
+                    
+                    # Check final position
+                    final_position = await self.exchange_client.get_account_positions()
+                    if abs(final_position) < 0.001:
+                        self.logger.log("Force close successful", "INFO")
+                        return True
+                    else:
+                        self.logger.log(f"Force close failed, position still exists: {final_position}", "ERROR")
+                        self.logger.log("This may indicate a deeper issue with the exchange or position tracking", "ERROR")
+                        return False
+                else:
+                    self.logger.log("Force close market order failed", "ERROR")
+                    return False
+            else:
+                self.logger.log("Market order not available for force close", "ERROR")
+                return False
+                
+        except Exception as e:
+            self.logger.log(f"Error in force close: {e}", "ERROR")
             return False
