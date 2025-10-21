@@ -40,6 +40,12 @@ def parse_arguments():
     parser.add_argument('--boost', action='store_true',
                         help='Use market orders for closing (faster execution)')
 
+    # Closing behavior (limit-first with retries)
+    parser.add_argument('--close-retry-max', type=int, default=5,
+                        help='Max retries for limit close before falling back to market (default: 5)')
+    parser.add_argument('--close-retry-timeout', type=int, default=60,
+                        help='Seconds to wait for each limit close attempt (default: 60)')
+
     return parser.parse_args()
 
 
@@ -106,7 +112,9 @@ async def main():
         grid_step=Decimal(0),  # Not used in simple strategy
         stop_price=Decimal(-1),  # Not used in simple strategy
         pause_price=Decimal(-1),  # Not used in simple strategy
-        boost_mode=args.boost
+        boost_mode=args.boost,
+        close_retry_max=args.close_retry_max,
+        close_retry_timeout=args.close_retry_timeout,
     )
 
     # Create and run the bot
@@ -120,6 +128,8 @@ async def main():
         print(f"  Hold Duration: {args.hold_minutes} minutes")
         print(f"  Loop Mode: {'Infinite' if args.loops == -1 else f'{args.loops} loops'}")
         print(f"  Boost Mode: {args.boost}")
+        print(f"  Close Retry Max: {args.close_retry_max}")
+        print(f"  Close Retry Timeout: {args.close_retry_timeout}s")
         print("=" * 50)
         
         await bot.simple_run(hold_duration_minutes=args.hold_minutes, loop_count=args.loops)

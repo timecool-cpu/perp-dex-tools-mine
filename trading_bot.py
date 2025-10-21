@@ -32,6 +32,9 @@ class TradingConfig:
     stop_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    # 新增：平仓限价重试配置
+    close_retry_max: int = 5
+    close_retry_timeout: int = 60
 
     @property
     def close_order_side(self) -> str:
@@ -1029,13 +1032,12 @@ class TradingBot:
             return None
 
     async def _close_position_simple(self, quantity: Decimal, entry_price: Decimal) -> bool:
-        """Close position using market order or limit order."""
+        """Close position using limit-first strategy with retries, fallback to market."""
         try:
             # First, check and cancel any active orders before closing position
             try:
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
                 if active_orders:
-                    self.logger.log(f"Found {len(active_orders)} active orders before closing position", "WARNING")
                     for order in active_orders:
                         try:
                             order_id = order.get('order_id') if isinstance(order, dict) else getattr(order, 'order_id', None)
@@ -1044,157 +1046,134 @@ class TradingBot:
                                 await self.exchange_client.cancel_order(order_id)
                         except Exception as cancel_error:
                             self.logger.log(f"Error cancelling order {order}: {cancel_error}", "WARNING")
-                    await asyncio.sleep(5)  # Wait for cancellations to process
             except Exception as e:
                 self.logger.log(f"Error checking active orders before close: {e}", "WARNING")
-            
-            # CRITICAL: Get actual position size from account, not from parameter
-            actual_position = await self.exchange_client.get_account_positions()
-            if actual_position == 0:
-                self.logger.log("No position to close", "INFO")
-                return True
-            
-            # Use actual position size for closing
-            close_quantity = abs(actual_position)
-            close_side = "sell" if actual_position > 0 else "buy"
-            
-            self.logger.log(f"CRITICAL: Closing actual position: {close_quantity} {close_side} (parameter was: {quantity})", "WARNING")
-            
-            # Check if this is a partial position
-            if abs(actual_position) != abs(quantity):
-                self.logger.log(f"WARNING: Position size mismatch - actual: {actual_position}, expected: {quantity}", "WARNING")
-                self.logger.log("This may be due to partial fills or previous incomplete closes", "WARNING")
-            
-            # Check if exchange supports market orders
-            has_market_order = hasattr(self.exchange_client, 'place_close_market_order')
-            has_general_market_order = hasattr(self.exchange_client, 'place_market_order')
-            
-            # Option 1: Use market order for immediate execution (preferred for closing)
-            if has_market_order:
-                self.logger.log("Using close market order to close position", "INFO")
-                close_result = await self.exchange_client.place_close_market_order(
-                    self.config.contract_id,
-                    close_quantity,
-                    close_side
-                )
-            elif has_general_market_order:
-                self.logger.log("Using market order to close position", "INFO")
-                close_result = await self.exchange_client.place_market_order(
-                    self.config.contract_id,
-                    close_quantity,
-                    close_side
-                )
-            else:
-                # Option 2: Use limit order with slight price adjustment for better execution
-                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
-                
-                if close_side == 'sell':
-                    # For sell orders, cross the spread to the bid for quick execution
-                    close_price = best_bid
-                else:
-                    # For buy orders, cross the spread to the ask for quick execution
-                    close_price = best_ask
-                
-                self.logger.log(f"Using limit order to close position @ {close_price}", "INFO")
-                close_result = await self.exchange_client.place_close_order(
-                    self.config.contract_id,
-                    close_quantity,
-                    close_price,
-                    close_side
-                )
 
-            if close_result.success:
+            # Get actual position size and side (don't trust input quantity)
+            actual_position = await self.exchange_client.get_account_positions()
+            close_side = 'sell' if actual_position > 0 else 'buy'
+            close_quantity = abs(actual_position)
+
+            self.logger.log(f"CRITICAL: Closing actual position: {close_quantity} {close_side} (parameter was: {quantity})", "WARNING")
+
+            # If boost mode explicitly requested, use market-first (existing behavior)
+            has_close_market = hasattr(self.exchange_client, 'place_close_market_order')
+            has_general_market = hasattr(self.exchange_client, 'place_market_order')
+            if self.config.boost_mode:
+                if has_close_market:
+                    self.logger.log("Using close market order to close position (boost mode)", "INFO")
+                    close_result = await self.exchange_client.place_close_market_order(
+                        self.config.contract_id, close_quantity, close_side
+                    )
+                elif has_general_market:
+                    self.logger.log("Using market order to close position (boost mode)", "INFO")
+                    close_result = await self.exchange_client.place_market_order(
+                        self.config.contract_id, close_quantity, close_side
+                    )
+                else:
+                    self.logger.log("Market order not available; falling back to limit close", "WARNING")
+                    close_result = None
+            else:
+                close_result = None
+
+            # Non-boost path: limit-first with retries, then market fallback
+            if close_result is None or not getattr(close_result, 'success', False):
+                # Try up to close_retry_max attempts with progressively aggressive pricing
+                for attempt in range(1, self.config.close_retry_max + 1):
+                    try:
+                        best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                        if close_side == 'sell':
+                            # Cross the spread to bid; make more aggressive on retries
+                            close_price = best_bid - (self.config.tick_size * max(0, attempt - 1))
+                        else:
+                            # Cross the spread to ask; make more aggressive on retries
+                            close_price = best_ask + (self.config.tick_size * max(0, attempt - 1))
+
+                        self.logger.log(
+                            f"[CLOSE] Attempt {attempt}/{self.config.close_retry_max} with limit {close_side} @ {close_price}",
+                            "INFO"
+                        )
+                        limit_result = await self.exchange_client.place_close_order(
+                            self.config.contract_id, close_quantity, close_price, close_side
+                        )
+                        if not limit_result.success:
+                            self.logger.log(f"[CLOSE] Limit close placement failed: {limit_result.error_message}", "WARNING")
+                            # Continue to next attempt without waiting
+                            continue
+
+                        # Wait for fill for configured timeout
+                        filled = await self._wait_for_order_fill(limit_result.order_id, timeout=self.config.close_retry_timeout, is_open_order=False)
+                        if filled:
+                            self.logger.log(f"Position closed: {filled.filled_size} @ {filled.price}", "INFO")
+                            await asyncio.sleep(5)
+                            final_position = await self.exchange_client.get_account_positions()
+                            if abs(final_position) < 0.001:
+                                self.logger.log("Position close verified successfully", "INFO")
+                                return True
+                            else:
+                                self.logger.log(f"CRITICAL: Position still exists after close: {final_position}", "ERROR")
+                                # Even if order reports filled, position not zero; retry further
+                        else:
+                            # Cancel and retry with more aggressive price
+                            self.logger.log("Close order not filled within timeout, cancelling and retrying...", "WARNING")
+                            try:
+                                await self.exchange_client.cancel_order(limit_result.order_id)
+                                self.logger.log(f"Cancelled unfilled close order: {limit_result.order_id}", "INFO")
+                            except Exception as cancel_error:
+                                self.logger.log(f"Failed to cancel close order: {cancel_error}", "WARNING")
+                            # Continue loop for next attempt
+                            continue
+                    except Exception as e:
+                        self.logger.log(f"Error during close attempt {attempt}: {e}", "WARNING")
+                        continue
+
+                # After retries, use market fallback if available
+                if has_close_market:
+                    self.logger.log("Retries exhausted; using close market order to close position", "WARNING")
+                    market_result = await self.exchange_client.place_close_market_order(
+                        self.config.contract_id, close_quantity, close_side
+                    )
+                elif has_general_market:
+                    self.logger.log("Retries exhausted; using market order to close position", "WARNING")
+                    market_result = await self.exchange_client.place_market_order(
+                        self.config.contract_id, close_quantity, close_side
+                    )
+                else:
+                    self.logger.log("No market order available for fallback", "ERROR")
+                    return False
+
+                if market_result and market_result.success:
+                    self.logger.log(f"Market close order placed: {market_result.order_id}", "INFO")
+                    market_filled = await self._wait_for_order_fill(market_result.order_id, timeout=60, is_open_order=False)
+                    if market_filled:
+                        await asyncio.sleep(5)
+                        final_position = await self.exchange_client.get_account_positions()
+                        if abs(final_position) < 0.001:
+                            self.logger.log("Position close verified successfully (market)", "INFO")
+                            return True
+                    self.logger.log("Market fallback did not verify position close", "ERROR")
+                    return False
+                else:
+                    self.logger.log("Market fallback failed to place order", "ERROR")
+                    return False
+
+            # If boost-mode market close succeeded
+            if close_result and close_result.success:
                 self.logger.log(f"Close order placed: {close_result.order_id}", "INFO")
-                
-                # Wait for close order to be filled
                 close_filled = await self._wait_for_order_fill(close_result.order_id, timeout=60, is_open_order=False)
                 if close_filled:
-                    self.logger.log(f"Position closed: {close_filled.filled_size} @ {close_filled.price}", "INFO")
-                    
-                    # CRITICAL: Verify position is actually closed
-                    await asyncio.sleep(5)  # Wait longer for position update
+                    await asyncio.sleep(5)
                     final_position = await self.exchange_client.get_account_positions()
                     if abs(final_position) < 0.001:
                         self.logger.log("Position close verified successfully", "INFO")
                         return True
-                    else:
-                        self.logger.log(f"CRITICAL: Position still exists after close: {final_position}", "ERROR")
-                        self.logger.log("WebSocket showed filled but position not closed - possible partial fill or error", "ERROR")
-                        return False
-                else:
-                    self.logger.log("Close order not filled within 60 seconds, cancelling and retrying...", "WARNING")
-                    
-                    # Cancel the unfilled order
-                    try:
-                        await self.exchange_client.cancel_order(close_result.order_id)
-                        self.logger.log(f"Cancelled unfilled close order: {close_result.order_id}", "INFO")
-                    except Exception as cancel_error:
-                        self.logger.log(f"Failed to cancel order: {cancel_error}", "WARNING")
-                    
-                    # Retry with a more aggressive price
-                    self.logger.log("Retrying close order with more aggressive pricing...", "INFO")
-                    best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
-                    
-                    if close_side == 'sell':
-                        # For sell orders, use an even lower price for quick execution
-                        retry_price = best_bid - (self.config.tick_size * 2)
-                    else:
-                        # For buy orders, use an even higher price for quick execution
-                        retry_price = best_ask + (self.config.tick_size * 2)
-                    
-                    retry_result = await self.exchange_client.place_close_order(
-                        self.config.contract_id,
-                        close_quantity,
-                        retry_price,
-                        close_side
-                    )
-                    
-                    if retry_result.success:
-                        self.logger.log(f"Retry close order placed: {retry_result.order_id} @ {retry_price}", "INFO")
-                        retry_filled = await self._wait_for_order_fill(retry_result.order_id, timeout=60, is_open_order=False)
-                        if retry_filled:
-                            self.logger.log(f"Position closed on retry: {retry_filled.filled_size} @ {retry_filled.price}", "INFO")
-                            
-                            # CRITICAL: Verify position is actually closed
-                            await asyncio.sleep(5)  # Wait longer for position update
-                            final_position = await self.exchange_client.get_account_positions()
-                            if abs(final_position) < 0.001:
-                                self.logger.log("Retry close verified successfully", "INFO")
-                                return True
-                            else:
-                                self.logger.log(f"CRITICAL: Position still exists after retry close: {final_position}", "ERROR")
-                                self.logger.log("WebSocket showed filled but position not closed - possible partial fill or error", "ERROR")
-                                return False
-                        else:
-                            self.logger.log("Retry close order also failed, but position may have been closed", "WARNING")
-                            # Wait a bit more for potential delayed fills
-                            self.logger.log("Waiting additional 30 seconds for potential delayed fills...", "INFO")
-                            await asyncio.sleep(30)
-                            
-                            # Check if position is actually closed by checking account positions
-                            try:
-                                current_position = await self.exchange_client.get_account_positions()
-                                if abs(current_position) < 0.001:  # Position is effectively closed
-                                    self.logger.log("Position appears to be closed (checking account positions)", "INFO")
-                                    return True
-                                else:
-                                    self.logger.log(f"Position still exists: {current_position}", "WARNING")
-                                    # Try force close as last resort
-                                    return await self._force_close_position(current_position)
-                            except Exception as e:
-                                self.logger.log(f"Error checking position: {e}", "WARNING")
-                                return False
-                    else:
-                        self.logger.log(f"Failed to place retry close order: {retry_result.error_message}", "ERROR")
-                        return False
-            else:
-                self.logger.log(f"Failed to place close order: {close_result.error_message}", "ERROR")
+                self.logger.log("Boost-mode market close did not verify position close", "ERROR")
                 return False
 
         except Exception as e:
-            self.logger.log(f"Error closing position: {e}", "ERROR")
+            self.logger.log(f"Error in _close_position_simple: {e}", "ERROR")
             return False
-    
+
     async def _force_close_position(self, position_size: Decimal) -> bool:
         """Force close position using market order if available."""
         try:
